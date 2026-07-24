@@ -45,6 +45,8 @@ Apple platforms should import Apple's `AVFoundation` framework.
 
 Read [DESIGN.md](DESIGN.md) before adding public API, driver contracts, or capture
 backends.
+Use [APPLE_API_TRACE.md](APPLE_API_TRACE.md) to distinguish the current capture
+subset from the complete Apple AVFoundation framework.
 
 ## Build
 

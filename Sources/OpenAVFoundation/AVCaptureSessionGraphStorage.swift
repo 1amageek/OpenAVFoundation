@@ -548,6 +548,10 @@ final class AVCaptureSessionGraphStorage {
     private static func validatedCompleteGraph(
         _ graph: CaptureSessionGraph
     ) throws(AVCaptureSessionError) -> CaptureSessionGraph {
+        // FIXME(INCOMPLETE_IMPLEMENTATION): Session start currently routes one video
+        // device input to one video data output through this validator. It must
+        // not accept additional routes until source sharing, bounded fan-out,
+        // per-output backpressure, and lease release are implemented.
         guard !graph.inputs.isEmpty else {
             throw .missingInput
         }

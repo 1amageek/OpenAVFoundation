@@ -1,5 +1,11 @@
 # OpenAVFoundation Implementation Progress
 
+## Apple API trace
+
+- [x] Framework-level AVFoundation families are inventoried
+- [x] The capture-first subset is separated from full framework compatibility
+- [x] Callable one-input/one-output graph behavior has a source marker
+
 ## Smoke definition
 
 The second smoke is complete when an application can explicitly register a
