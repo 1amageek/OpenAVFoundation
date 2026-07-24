@@ -106,9 +106,9 @@ Verification commands and results are recorded here after execution.
 
 | Target | Command | Result |
 |---|---|---|
-| macOS behavior smoke | `xcodebuild test ... -only-testing:OpenAVFoundationTests` | Passed: 16 tests |
-| WASM shared build | `swift build --swift-sdk swift-6.3.1-RELEASE_wasm --target OpenAVFoundation` | Passed: capture lifecycle included |
-| Embedded WASM shared build | `swift build --swift-sdk swift-6.3.1-RELEASE_wasm-embedded --target OpenAVFoundation` | Passed: synchronous capture lifecycle included |
+| macOS behavior smoke | `xcodebuild test ... -only-testing:OpenAVFoundationTests SWIFT_EXEC=.../swift-latest.xctoolchain/usr/bin/swiftc` | Passed on 2026-07-25: 16 tests with Swift 6.4 snapshot |
+| WASM shared build | `swift build --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm --target OpenAVFoundation` | Passed on 2026-07-25: capture lifecycle included |
+| Embedded WASM shared build | `swift build --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm-embedded --target OpenAVFoundation` | Passed on 2026-07-25: synchronous capture lifecycle included |
 
 ## Deliberately absent
 
