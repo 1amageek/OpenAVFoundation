@@ -1,5 +1,7 @@
 #if !hasFeature(Embedded)
-public actor AVCaptureDeviceRegistry {
+import Synchronization
+
+public final class AVCaptureDeviceRegistry: Sendable {
     private struct ProviderBox: Sendable {
         let driverID: CaptureDriverID
         let authorizationStatus:
@@ -37,13 +39,22 @@ public actor AVCaptureDeviceRegistry {
         }
     }
 
-    private struct State: Sendable {
-        var providers: [CaptureDriverID: ProviderBox] = [:]
-        var providerOrder: [CaptureDriverID] = []
-        var devices: [CaptureDeviceID: AVCaptureDevice] = [:]
+    private struct ProviderEntry: Sendable {
+        let driverID: CaptureDriverID
+        let box: ProviderBox
     }
 
-    private var state = State()
+    private struct DeviceEntry: Sendable {
+        let deviceID: CaptureDeviceID
+        let device: AVCaptureDevice
+    }
+
+    private struct State: Sendable {
+        var providers: [ProviderEntry] = []
+        var devices: [DeviceEntry] = []
+    }
+
+    private let state = Mutex(State())
 
     public init() {}
 
@@ -51,11 +62,19 @@ public actor AVCaptureDeviceRegistry {
         _ provider: Provider
     ) throws(AVCaptureDeviceError) {
         let providerBox = ProviderBox(provider)
-        guard state.providers[providerBox.driverID] == nil else {
-            throw .duplicateProvider(providerBox.driverID)
+        try state.withLock { state throws(AVCaptureDeviceError) in
+            guard !state.providers.contains(where: {
+                $0.driverID == providerBox.driverID
+            }) else {
+                throw .duplicateProvider(providerBox.driverID)
+            }
+            state.providers.append(
+                ProviderEntry(
+                    driverID: providerBox.driverID,
+                    box: providerBox
+                )
+            )
         }
-        state.providers[providerBox.driverID] = providerBox
-        state.providerOrder.append(providerBox.driverID)
     }
 
     public func discoverySession(
@@ -103,39 +122,68 @@ public actor AVCaptureDeviceRegistry {
     }
 
     private func providerSnapshot() -> [ProviderBox] {
-        state.providerOrder.compactMap { state.providers[$0] }
+        state.withLock { state in
+            var providers: [ProviderBox] = []
+            providers.reserveCapacity(state.providers.count)
+            for entry in state.providers {
+                providers.append(entry.box)
+            }
+            return providers
+        }
     }
 
     private func provider(
         for driverID: CaptureDriverID
     ) throws(AVCaptureDeviceError) -> ProviderBox {
-        guard let provider = state.providers[driverID] else {
-            throw .unknownProvider(driverID)
+        try state.withLock { state throws(AVCaptureDeviceError) in
+            guard let provider = state.providers.first(where: {
+                $0.driverID == driverID
+            }) else {
+                throw .unknownProvider(driverID)
+            }
+            return provider.box
         }
-        return provider
     }
 
     private func resolvedDevices(
         for discoveredDevices: [DiscoveredDevice]
     ) -> [AVCaptureDevice] {
-        var resolved: [AVCaptureDevice] = []
-        resolved.reserveCapacity(discoveredDevices.count)
+        state.withLock { state in
+            var resolved: [AVCaptureDevice] = []
+            resolved.reserveCapacity(discoveredDevices.count)
 
-        for discoveredDevice in discoveredDevices {
-            let descriptor = discoveredDevice.descriptor
-            if let existing = state.devices[descriptor.deviceID],
-               existing.descriptor == descriptor {
-                resolved.append(existing)
-            } else {
-                let device = AVCaptureDevice(
-                    descriptor: descriptor,
-                    handleOpener: discoveredDevice.handleOpener
-                )
-                state.devices[descriptor.deviceID] = device
-                resolved.append(device)
+            for discoveredDevice in discoveredDevices {
+                let descriptor = discoveredDevice.descriptor
+                if let existing = state.devices.first(where: {
+                    $0.deviceID == descriptor.deviceID
+                }),
+                   existing.device.descriptor == descriptor {
+                    resolved.append(existing.device)
+                } else {
+                    let device = AVCaptureDevice(
+                        descriptor: descriptor,
+                        handleOpener: discoveredDevice.handleOpener
+                    )
+                    if let index = state.devices.firstIndex(where: {
+                        $0.deviceID == descriptor.deviceID
+                    }) {
+                        state.devices[index] = DeviceEntry(
+                            deviceID: descriptor.deviceID,
+                            device: device
+                        )
+                    } else {
+                        state.devices.append(
+                            DeviceEntry(
+                                deviceID: descriptor.deviceID,
+                                device: device
+                            )
+                        )
+                    }
+                    resolved.append(device)
+                }
             }
+            return resolved
         }
-        return resolved
     }
 
     private struct DiscoveredDevice: Sendable {
@@ -148,7 +196,7 @@ public actor AVCaptureDeviceRegistry {
         request: CaptureDiscoveryRequest
     ) async throws(AVCaptureDeviceError) -> [DiscoveredDevice] {
         var devices: [DiscoveredDevice] = []
-        var observedDeviceIDs: Set<CaptureDeviceID> = []
+        var observedDeviceIDs: [CaptureDeviceID] = []
 
         for provider in providers {
             let discovered: [CaptureDeviceDescriptor]
@@ -171,9 +219,10 @@ public actor AVCaptureDeviceRegistry {
                 guard request.includes(descriptor) else {
                     continue
                 }
-                guard observedDeviceIDs.insert(descriptor.deviceID).inserted else {
+                guard !observedDeviceIDs.contains(descriptor.deviceID) else {
                     throw .duplicateDevice(descriptor.deviceID)
                 }
+                observedDeviceIDs.append(descriptor.deviceID)
                 devices.append(
                     DiscoveredDevice(
                         descriptor: descriptor,

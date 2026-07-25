@@ -1,16 +1,42 @@
-#if !hasFeature(Embedded)
 import Synchronization
-#endif
 
 public class AVCaptureInput {
     public final class Port {
 #if hasFeature(Embedded)
-        // Embedded Swift has no weak references. Owner isolation requires a
-        // port not to outlive the input that vends it.
-        private unowned(unsafe) let sourceInput: AVCaptureInput
+        private final class InputReference: Sendable {
+            // Embedded Swift has no weak references. The input owns every port
+            // it vends, and a port must not escape that input's lifetime.
+            // Valid Embedded capture graphs retain the input before reading
+            // this immutable reference.
+            nonisolated(unsafe) unowned(unsafe) let value: AVCaptureInput
+
+            init(_ value: AVCaptureInput) {
+                self.value = value
+            }
+
+            var resolvedValue: AVCaptureInput? {
+                value
+            }
+        }
 #else
-        private nonisolated(unsafe) weak var sourceInput: AVCaptureInput?
+        private final class InputReference: Sendable {
+            // Native/WASM weak storage prevents the input -> port ->
+            // input cycle. The reference is assigned only during
+            // initialization; runtime zeroing is observed through
+            // resolvedValue, and the stable-port release test verifies that
+            // this wrapper does not extend the input lifetime.
+            nonisolated(unsafe) weak var value: AVCaptureInput?
+
+            init(_ value: AVCaptureInput) {
+                self.value = value
+            }
+
+            var resolvedValue: AVCaptureInput? {
+                value
+            }
+        }
 #endif
+        private let sourceInput: InputReference
         private let state: PortState
         public let mediaType: AVMediaType
 
@@ -19,22 +45,19 @@ public class AVCaptureInput {
             mediaType: AVMediaType,
             state: PortState
         ) {
-            sourceInput = input
+            sourceInput = InputReference(input)
             self.mediaType = mediaType
             self.state = state
         }
 
         public var input: AVCaptureInput {
-#if hasFeature(Embedded)
-            sourceInput
-#else
-            guard let sourceInput else {
+            let input = sourceInput.resolvedValue
+            guard let input else {
                 preconditionFailure(
                     "An AVCaptureInput.Port must not outlive its input."
                 )
             }
-            return sourceInput
-#endif
+            return input
         }
 
         public var isEnabled: Bool {
@@ -48,9 +71,6 @@ public class AVCaptureInput {
     }
 
     final class PortState {
-#if hasFeature(Embedded)
-        var isEnabled = true
-#else
         private let enabled = Mutex(true)
 
         var isEnabled: Bool {
@@ -61,65 +81,40 @@ public class AVCaptureInput {
                 enabled.withLock { value in value = newValue }
             }
         }
-#endif
     }
 
-    private struct State {
+    private struct State: Sendable {
         var ports: [Port] = []
         var ownerID: ObjectIdentifier?
     }
 
-#if hasFeature(Embedded)
-    private var state = State()
-#else
     private let state = Mutex(State())
-#endif
 
     init() {}
 
     public var ports: [Port] {
-#if hasFeature(Embedded)
-        state.ports
-#else
         state.withLock { state in state.ports }
-#endif
     }
 
     func installPorts(_ mediaTypes: [AVMediaType]) {
         let ports = mediaTypes.map {
             Port(input: self, mediaType: $0, state: PortState())
         }
-#if hasFeature(Embedded)
-        precondition(state.ports.isEmpty)
-        state.ports = ports
-#else
         state.withLock { state in
             precondition(state.ports.isEmpty)
             state.ports = ports
         }
-#endif
     }
 
     func canBeOwned(by ownerID: ObjectIdentifier) -> Bool {
-#if hasFeature(Embedded)
-        state.ownerID == nil || state.ownerID == ownerID
-#else
         state.withLock { state in
             state.ownerID == nil || state.ownerID == ownerID
         }
-#endif
     }
 
     func claimOwnership(
         by ownerID: ObjectIdentifier
     ) -> Bool {
-#if hasFeature(Embedded)
-        guard state.ownerID == nil || state.ownerID == ownerID else {
-            return false
-        }
-        state.ownerID = ownerID
-        return true
-#else
         state.withLock { state in
             guard state.ownerID == nil || state.ownerID == ownerID else {
                 return false
@@ -127,27 +122,18 @@ public class AVCaptureInput {
             state.ownerID = ownerID
             return true
         }
-#endif
     }
 
     func releaseOwnership(
         by ownerID: ObjectIdentifier
     ) {
-#if hasFeature(Embedded)
-        if state.ownerID == ownerID {
-            state.ownerID = nil
-        }
-#else
         state.withLock { state in
             if state.ownerID == ownerID {
                 state.ownerID = nil
             }
         }
-#endif
     }
 }
 
-#if !hasFeature(Embedded)
 extension AVCaptureInput.Port: Sendable {}
 extension AVCaptureInput.PortState: Sendable {}
-#endif

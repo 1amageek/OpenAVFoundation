@@ -8,6 +8,7 @@ public enum AVCaptureSessionRuntimeFailure:
         error: CaptureDriverError
     )
     case contract(CaptureContractError)
+    case deviceConfiguration(AVCaptureDeviceError)
     case snapshotDeviceMismatch(
         expected: CaptureDeviceID,
         actual: CaptureDeviceID
@@ -21,6 +22,11 @@ public enum AVCaptureSessionRuntimeFailure:
         expected: CaptureDeviceID,
         actual: CaptureDeviceID
     )
+    case streamEventCapabilitiesMismatch(
+        expected: CaptureStreamEventCapabilities,
+        actual: CaptureStreamEventCapabilities
+    )
+    case undeclaredStreamEvent(CaptureStreamEvent)
 }
 
 public enum AVCaptureSessionError: Error, Sendable, Equatable {
@@ -40,6 +46,7 @@ public enum AVCaptureSessionError: Error, Sendable, Equatable {
     case missingInput
     case missingOutput
     case missingVideoPort
+    case incompatibleVideoConnectionConfigurations
     case runtime(AVCaptureSessionRuntimeFailure)
     case startRollbackFailure(
         primary: AVCaptureSessionRuntimeFailure,

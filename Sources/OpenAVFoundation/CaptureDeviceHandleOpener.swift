@@ -1,7 +1,7 @@
 #if hasFeature(Embedded)
-struct CaptureDeviceHandleOpener {
+struct CaptureDeviceHandleOpener: Sendable {
     let open:
-        (CaptureDeviceID)
+        @Sendable (CaptureDeviceID)
             throws(CaptureDriverError) -> any CaptureDeviceHandle
 }
 #else

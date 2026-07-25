@@ -2,7 +2,7 @@
 
 ## Baseline
 
-- Review date: 2026-07-24
+- Review date: 2026-07-25
 - SDK: macOS 27.0 from the active Xcode beta
 - Documentation: Apple Developer Documentation read with `remark`
 - Local evidence: `AVFoundation.framework/Headers`, the SDK symbol graph,
@@ -16,7 +16,7 @@ compatibility.
 
 | Apple area | Open implementation | Status |
 |---|---|---|
-| Capture setup | Device discovery, one input/output session graph | Partial |
+| Capture setup | Device discovery, one input/multiple-output session graph | Partial |
 | Audio and video sample capture | Video data output only | Partial |
 | Photo capture | No declaration | Planned |
 | Depth, metadata, and synchronized outputs | No declaration | Planned |
@@ -32,11 +32,11 @@ compatibility.
 |---|---|---|---|---|
 | `AVMediaType` and authorization | `AVMediaFormat.h`, `AVCaptureDevice.h` | Typed media values and provider authorization mapping | Partial | Broader media families |
 | `AVCaptureDevice` discovery | `AVCaptureDevice.h` | Explicit provider registry, filtering, stable identity | Partial | Synchronous snapshot observation and hot-plug |
-| Device configuration | `AVCaptureDevice.h` | Driver-preferred format at session start | Partial | Public lock/configure facade and controls |
+| Device configuration | `AVCaptureDevice.h` | Explicit capability resolution plus revision-bound format, frame-rate, focus, exposure, white-balance, and zoom staging | Partial | Configuration locking parity, subject-area monitoring, smooth autofocus, torch, and specialized controls |
 | `AVCaptureInput` and ports | `AVCaptureInput.h` | Device input and stable video ports | Partial | Audio and specialized ports |
-| `AVCaptureOutput` and connections | `AVCaptureOutputBase.h` | One video output and automatic connection | Partial | Explicit connection editing and multiple outputs |
-| `AVCaptureSession` | `AVCaptureSession.h` | Atomic idle graph transaction and ordered lifecycle | Partial | Runtime reconfiguration, presets, interruptions |
-| `AVCaptureVideoDataOutput` | `AVCaptureVideoDataOutput.h` | Synchronous zero-copy sample delivery | Partial | Settings surface, drop callback, bounded queue policy |
+| `AVCaptureOutput` and connections | `AVCaptureOutputBase.h` plus `remark` connection-property review | Multiple video outputs, automatic connections, and staged orientation/stabilization/mirroring | Partial | Rotation-angle API, capability properties, explicit connection editing, and additional output types |
+| `AVCaptureSession` | `AVCaptureSession.h` | Failure-atomic graph lifecycle plus typed interruption, pressure, source-drop, and terminal-failure state | Partial | Runtime graph reconfiguration and presets |
+| `AVCaptureVideoDataOutput` | `AVCaptureVideoDataOutput.h` | Bounded zero-copy delivery and portable metadata-only source-drop callback | Partial | Video settings surface; Apple's dropped callback carries a platform sample buffer instead |
 | Output synchronization | `AVCaptureDataOutputSynchronizer.h` | No declaration | Planned | Correlated multi-output delivery |
 | Audio/metadata/depth/photo outputs | Corresponding capture headers | No declaration | Planned | Separate behavior slices |
 | Preview | `AVCaptureVideoPreviewLayer.h` | No shared declaration | Adapter | Platform presentation packages |

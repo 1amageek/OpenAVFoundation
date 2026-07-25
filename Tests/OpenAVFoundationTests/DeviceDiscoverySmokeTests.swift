@@ -7,13 +7,13 @@ struct DeviceDiscoverySmokeTests {
     func registeredProvidersProduceStableDevices() async throws {
         let fixture = try TestFixture()
         let registry = AVCaptureDeviceRegistry()
-        try await registry.register(
+        try registry.register(
             TestCaptureProvider(
                 driverID: fixture.firstDriverID,
                 descriptors: [fixture.firstDescriptor]
             )
         )
-        try await registry.register(
+        try registry.register(
             TestCaptureProvider(
                 driverID: fixture.secondDriverID,
                 descriptors: [fixture.secondDescriptor]
@@ -46,7 +46,7 @@ struct DeviceDiscoverySmokeTests {
     func discoveryFiltersProviderResults() async throws {
         let fixture = try TestFixture()
         let registry = AVCaptureDeviceRegistry()
-        try await registry.register(
+        try registry.register(
             TestCaptureProvider(
                 driverID: fixture.firstDriverID,
                 descriptors: [fixture.firstDescriptor, fixture.audioDescriptor]
@@ -75,7 +75,7 @@ struct DeviceDiscoverySmokeTests {
             authorizationStatus: .notDetermined,
             requestedAuthorizationStatus: .authorized
         )
-        try await registry.register(provider)
+        try registry.register(provider)
 
         let initial = try await registry.authorizationStatus(
             for: .video,
@@ -105,7 +105,7 @@ struct DeviceDiscoverySmokeTests {
             authorizationStatus: .notDetermined,
             requestedAuthorizationStatus: .denied
         )
-        try await registry.register(provider)
+        try registry.register(provider)
 
         let granted = try await registry.requestAccess(
             for: .video,
@@ -128,12 +128,12 @@ struct DeviceDiscoverySmokeTests {
             driverID: fixture.firstDriverID,
             descriptors: [fixture.firstDescriptor]
         )
-        try await registry.register(provider)
+        try registry.register(provider)
 
-        await #expect(
+        #expect(
             throws: AVCaptureDeviceError.duplicateProvider(fixture.firstDriverID)
         ) {
-            try await registry.register(provider)
+            try registry.register(provider)
         }
     }
 
@@ -156,7 +156,7 @@ struct DeviceDiscoverySmokeTests {
     func unsupportedAuthorizationMediaType() async throws {
         let fixture = try TestFixture()
         let registry = AVCaptureDeviceRegistry()
-        try await registry.register(
+        try registry.register(
             TestCaptureProvider(
                 driverID: fixture.firstDriverID,
                 descriptors: [fixture.firstDescriptor]
@@ -182,7 +182,7 @@ struct DeviceDiscoverySmokeTests {
         let providerError = CaptureDriverError.providerUnavailable(
             driverID: fixture.firstDriverID
         )
-        try await registry.register(
+        try registry.register(
             TestCaptureProvider(
                 driverID: fixture.firstDriverID,
                 descriptors: [],
@@ -208,7 +208,7 @@ struct DeviceDiscoverySmokeTests {
     func duplicateDeviceDescriptorsAreRejected() async throws {
         let fixture = try TestFixture()
         let registry = AVCaptureDeviceRegistry()
-        try await registry.register(
+        try registry.register(
             TestCaptureProvider(
                 driverID: fixture.firstDriverID,
                 descriptors: [fixture.firstDescriptor, fixture.firstDescriptor]
@@ -232,7 +232,7 @@ struct DeviceDiscoverySmokeTests {
     func foreignDeviceDescriptorIsRejected() async throws {
         let fixture = try TestFixture()
         let registry = AVCaptureDeviceRegistry()
-        try await registry.register(
+        try registry.register(
             TestCaptureProvider(
                 driverID: fixture.firstDriverID,
                 descriptors: [fixture.secondDescriptor]
@@ -251,6 +251,38 @@ struct DeviceDiscoverySmokeTests {
                 position: .unspecified
             )
         }
+    }
+
+    @Test("Provider discovery can reenter registry registration")
+    func providerDiscoveryCanReenterRegistryRegistration() async throws {
+        let fixture = try TestFixture()
+        let registry = AVCaptureDeviceRegistry()
+        let nested = TestCaptureProvider(
+            driverID: fixture.secondDriverID,
+            descriptors: [fixture.secondDescriptor]
+        )
+        try registry.register(
+            ReentrantCaptureProvider(
+                registry: registry,
+                driverID: fixture.firstDriverID,
+                descriptor: fixture.firstDescriptor,
+                nestedProvider: nested
+            )
+        )
+
+        let first = try await registry.discoverySession(
+            deviceTypes: [.external],
+            mediaType: .video,
+            position: .unspecified
+        )
+        let second = try await registry.discoverySession(
+            deviceTypes: [.external],
+            mediaType: .video,
+            position: .unspecified
+        )
+
+        #expect(first.devices.count == 1)
+        #expect(second.devices.count == 2)
     }
 }
 
@@ -351,6 +383,64 @@ private actor TestCaptureProvider: CaptureDeviceProvider {
             throw discoveryError
         }
         return descriptors
+    }
+
+    func deviceHandle(
+        for deviceID: CaptureDeviceID
+    ) async throws(CaptureDriverError) -> any CaptureDeviceHandle {
+        throw .deviceNotFound(deviceID)
+    }
+}
+
+private final class ReentrantCaptureProvider<
+    NestedProvider: CaptureDeviceProvider
+>: CaptureDeviceProvider, Sendable {
+    let driverID: CaptureDriverID
+
+    private let registry: AVCaptureDeviceRegistry
+    private let descriptor: CaptureDeviceDescriptor
+    private let nestedProvider: NestedProvider
+
+    init(
+        registry: AVCaptureDeviceRegistry,
+        driverID: CaptureDriverID,
+        descriptor: CaptureDeviceDescriptor,
+        nestedProvider: NestedProvider
+    ) {
+        self.registry = registry
+        self.driverID = driverID
+        self.descriptor = descriptor
+        self.nestedProvider = nestedProvider
+    }
+
+    func authorizationStatus(
+        for mediaType: CaptureMediaTypeID
+    ) async -> CaptureAuthorizationStatus {
+        mediaType == .video ? .authorized : .denied
+    }
+
+    func requestAccess(
+        for mediaType: CaptureMediaTypeID
+    ) async throws(CaptureDriverError) -> CaptureAuthorizationStatus {
+        mediaType == .video ? .authorized : .denied
+    }
+
+    func devices(
+        matching request: CaptureDiscoveryRequest
+    ) async throws(CaptureDriverError) -> [CaptureDeviceDescriptor] {
+        do {
+            try registry.register(nestedProvider)
+        } catch {
+            guard error == .duplicateProvider(nestedProvider.driverID) else {
+                throw .backendFailure(
+                    driverID: driverID,
+                    deviceID: descriptor.deviceID,
+                    operation: .discovery,
+                    code: 1
+                )
+            }
+        }
+        return [descriptor]
     }
 
     func deviceHandle(

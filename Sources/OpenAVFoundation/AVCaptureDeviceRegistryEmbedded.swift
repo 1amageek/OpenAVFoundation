@@ -1,15 +1,17 @@
 #if hasFeature(Embedded)
-/// An owner-isolated registry for statically composed Embedded Swift providers.
-public final class AVCaptureDeviceRegistry {
-    private struct ProviderBox {
+import Synchronization
+
+/// A synchronized registry for statically composed Embedded Swift providers.
+public final class AVCaptureDeviceRegistry: Sendable {
+    private struct ProviderBox: Sendable {
         let driverID: CaptureDriverID
         let authorizationStatus:
-            (CaptureMediaTypeID) -> CaptureAuthorizationStatus
+            @Sendable (CaptureMediaTypeID) -> CaptureAuthorizationStatus
         let requestAccess:
-            (CaptureMediaTypeID)
+            @Sendable (CaptureMediaTypeID)
                 throws(CaptureDriverError) -> CaptureAuthorizationStatus
         let devices:
-            (CaptureDiscoveryRequest)
+            @Sendable (CaptureDiscoveryRequest)
                 throws(CaptureDriverError) -> [CaptureDeviceDescriptor]
         let handleOpener: CaptureDeviceHandleOpener
 
@@ -37,9 +39,22 @@ public final class AVCaptureDeviceRegistry {
         }
     }
 
-    private var providers: [CaptureDriverID: ProviderBox] = [:]
-    private var providerOrder: [CaptureDriverID] = []
-    private var devices: [CaptureDeviceID: AVCaptureDevice] = [:]
+    private struct ProviderEntry: Sendable {
+        let driverID: CaptureDriverID
+        let box: ProviderBox
+    }
+
+    private struct DeviceEntry: Sendable {
+        let deviceID: CaptureDeviceID
+        let device: AVCaptureDevice
+    }
+
+    private struct State: Sendable {
+        var providers: [ProviderEntry] = []
+        var devices: [DeviceEntry] = []
+    }
+
+    private let state = Mutex(State())
 
     public init() {}
 
@@ -47,11 +62,19 @@ public final class AVCaptureDeviceRegistry {
         _ provider: Provider
     ) throws(AVCaptureDeviceError) {
         let providerBox = ProviderBox(provider)
-        guard providers[providerBox.driverID] == nil else {
-            throw .duplicateProvider(providerBox.driverID)
+        try state.withLock { state throws(AVCaptureDeviceError) in
+            guard !state.providers.contains(where: {
+                $0.driverID == providerBox.driverID
+            }) else {
+                throw .duplicateProvider(providerBox.driverID)
+            }
+            state.providers.append(
+                ProviderEntry(
+                    driverID: providerBox.driverID,
+                    box: providerBox
+                )
+            )
         }
-        providers[providerBox.driverID] = providerBox
-        providerOrder.append(providerBox.driverID)
     }
 
     public func discoverySession(
@@ -67,12 +90,17 @@ public final class AVCaptureDeviceRegistry {
         var discoveredDevices: [
             (descriptor: CaptureDeviceDescriptor, opener: CaptureDeviceHandleOpener)
         ] = []
-        var observedDeviceIDs: Set<CaptureDeviceID> = []
+        var observedDeviceIDs: [CaptureDeviceID] = []
 
-        for driverID in providerOrder {
-            guard let provider = providers[driverID] else {
-                throw .unknownProvider(driverID)
+        let providers = state.withLock { state in
+            var providers: [ProviderBox] = []
+            providers.reserveCapacity(state.providers.count)
+            for entry in state.providers {
+                providers.append(entry.box)
             }
+            return providers
+        }
+        for provider in providers {
             let discovered: [CaptureDeviceDescriptor]
             do {
                 discovered = try provider.devices(request)
@@ -93,9 +121,10 @@ public final class AVCaptureDeviceRegistry {
                 guard request.includes(descriptor) else {
                     continue
                 }
-                guard observedDeviceIDs.insert(descriptor.deviceID).inserted else {
+                guard !observedDeviceIDs.contains(descriptor.deviceID) else {
                     throw .duplicateDevice(descriptor.deviceID)
                 }
+                observedDeviceIDs.append(descriptor.deviceID)
                 discoveredDevices.append(
                     (descriptor: descriptor, opener: provider.handleOpener)
                 )
@@ -104,18 +133,36 @@ public final class AVCaptureDeviceRegistry {
 
         var resolved: [AVCaptureDevice] = []
         resolved.reserveCapacity(discoveredDevices.count)
-        for discoveredDevice in discoveredDevices {
-            let descriptor = discoveredDevice.descriptor
-            if let existing = devices[descriptor.deviceID],
-               existing.descriptor == descriptor {
-                resolved.append(existing)
-            } else {
-                let device = AVCaptureDevice(
-                    descriptor: descriptor,
-                    handleOpener: discoveredDevice.opener
-                )
-                devices[descriptor.deviceID] = device
-                resolved.append(device)
+        state.withLock { state in
+            for discoveredDevice in discoveredDevices {
+                let descriptor = discoveredDevice.descriptor
+                if let existing = state.devices.first(where: {
+                    $0.deviceID == descriptor.deviceID
+                }),
+                   existing.device.descriptor == descriptor {
+                    resolved.append(existing.device)
+                } else {
+                    let device = AVCaptureDevice(
+                        descriptor: descriptor,
+                        handleOpener: discoveredDevice.opener
+                    )
+                    if let index = state.devices.firstIndex(where: {
+                        $0.deviceID == descriptor.deviceID
+                    }) {
+                        state.devices[index] = DeviceEntry(
+                            deviceID: descriptor.deviceID,
+                            device: device
+                        )
+                    } else {
+                        state.devices.append(
+                            DeviceEntry(
+                                deviceID: descriptor.deviceID,
+                                device: device
+                            )
+                        )
+                    }
+                    resolved.append(device)
+                }
             }
         }
         return AVCaptureDevice.DiscoverySession(devices: resolved)
@@ -149,10 +196,14 @@ public final class AVCaptureDeviceRegistry {
     private func provider(
         for driverID: CaptureDriverID
     ) throws(AVCaptureDeviceError) -> ProviderBox {
-        guard let provider = providers[driverID] else {
-            throw .unknownProvider(driverID)
+        try state.withLock { state throws(AVCaptureDeviceError) in
+            guard let provider = state.providers.first(where: {
+                $0.driverID == driverID
+            }) else {
+                throw .unknownProvider(driverID)
+            }
+            return provider.box
         }
-        return provider
     }
 
     private func captureRequest(

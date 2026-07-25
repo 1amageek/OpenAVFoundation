@@ -1,5 +1,5 @@
 extension AVCaptureDevice {
-    public final class DiscoverySession {
+    public final class DiscoverySession: Sendable {
         public let devices: [AVCaptureDevice]
 
         init(devices: [AVCaptureDevice]) {
@@ -7,7 +7,3 @@ extension AVCaptureDevice {
         }
     }
 }
-
-#if !hasFeature(Embedded)
-extension AVCaptureDevice.DiscoverySession: Sendable {}
-#endif

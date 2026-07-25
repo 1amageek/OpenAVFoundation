@@ -1,9 +1,16 @@
 #if !hasFeature(Embedded)
+import Synchronization
+
 public final class AVCaptureSession: Sendable {
     private let graph = AVCaptureSessionGraphStorage()
-    private let lifecycle = CaptureSessionLifecycle()
+    private let runtimeEvents: CaptureSessionRuntimeEventHub
+    private let lifecycle: CaptureSessionLifecycle
 
-    public init() {}
+    public init() {
+        let runtimeEvents = CaptureSessionRuntimeEventHub()
+        self.runtimeEvents = runtimeEvents
+        lifecycle = CaptureSessionLifecycle(runtimeEvents: runtimeEvents)
+    }
 
     public var inputs: [AVCaptureInput] {
         graph.inputs
@@ -18,7 +25,25 @@ public final class AVCaptureSession: Sendable {
     }
 
     public var isRunning: Bool {
-        graph.isRunning
+        graph.isRunning && runtimeEvents.isActive
+    }
+
+    public var runtimeState: AVCaptureSessionRuntimeState {
+        runtimeEvents.runtimeState
+    }
+
+    public var systemPressure: CaptureSystemPressure? {
+        runtimeEvents.pressure
+    }
+
+    public var lastSourceDrop: CaptureStreamDropEvent? {
+        runtimeEvents.lastSourceDrop
+    }
+
+    public func setRuntimeEventSink(
+        _ sink: (any AVCaptureSessionRuntimeEventSink)?
+    ) {
+        runtimeEvents.setSink(sink)
     }
 
     public func beginConfiguration() throws(AVCaptureSessionError) {
@@ -63,18 +88,24 @@ public final class AVCaptureSession: Sendable {
 
     public func startRunning() async throws(AVCaptureSessionError) {
         let plan = try graph.prepareToStart()
+        runtimeEvents.beginStart(routes: plan.routes)
         do {
             try await lifecycle.start(plan)
             graph.finishStartSuccessfully()
+            runtimeEvents.finishStartSuccessfully()
         } catch {
             let cleanupRequired: Bool
+            let cleanupFailures: [CaptureDriverError]?
             switch error {
-            case .startRollbackFailure:
+            case let .startRollbackFailure(_, failures):
                 cleanupRequired = true
+                cleanupFailures = failures
             default:
                 cleanupRequired = false
+                cleanupFailures = nil
             }
             graph.finishStart(cleanupRequired: cleanupRequired)
+            runtimeEvents.finishStart(cleanupFailures: cleanupFailures)
             throw error
         }
     }
@@ -83,11 +114,21 @@ public final class AVCaptureSession: Sendable {
         guard try graph.prepareToStop() else {
             return
         }
+        runtimeEvents.beginStop()
         do {
             try await lifecycle.stop()
             graph.finishStop(cleanupRequired: false)
+            runtimeEvents.finishStop(cleanupFailures: nil)
         } catch {
             graph.finishStop(cleanupRequired: true)
+            let cleanupFailures: [CaptureDriverError]
+            switch error {
+            case let .stopFailures(failures):
+                cleanupFailures = failures
+            default:
+                cleanupFailures = []
+            }
+            runtimeEvents.finishStop(cleanupFailures: cleanupFailures)
             throw error
         }
     }
@@ -103,26 +144,61 @@ private struct CaptureSessionCleanupResult: Sendable {
     var failures: [CaptureDriverError]
 }
 
-private actor CaptureSessionLifecycle {
-    private var resources: CaptureSessionResources?
+private final class CaptureSessionLifecycle: Sendable {
+    private enum Phase: Sendable {
+        case idle
+        case starting
+        case running
+        case stopping
+    }
+
+    private struct State: Sendable {
+        var phase = Phase.idle
+        var resources: CaptureSessionResources?
+    }
+
+    private let state = Mutex(State())
+    private let runtimeEvents: CaptureSessionRuntimeEventHub
+
+    init(runtimeEvents: CaptureSessionRuntimeEventHub) {
+        self.runtimeEvents = runtimeEvents
+    }
 
     func start(
         _ plan: CaptureSessionStartPlan
     ) async throws(AVCaptureSessionError) {
-        precondition(resources == nil)
+        let reserved = state.withLock { state in
+            guard state.phase == .idle, state.resources == nil else {
+                return false
+            }
+            state.phase = .starting
+            return true
+        }
+        guard reserved else {
+            throw .sessionBusy
+        }
         var pending = CaptureSessionResources()
 
         do {
             try await prepare(plan, resources: &pending)
-            resources = pending
+            state.withLock { state in
+                state.resources = pending
+                state.phase = .running
+            }
         } catch {
             let failure = error
             let cleanup = await clean(pending)
             if cleanup.failures.isEmpty {
-                resources = nil
+                state.withLock { state in
+                    state.resources = nil
+                    state.phase = .idle
+                }
                 throw .runtime(failure)
             }
-            resources = cleanup.resources
+            state.withLock { state in
+                state.resources = cleanup.resources
+                state.phase = .running
+            }
             throw .startRollbackFailure(
                 primary: failure,
                 cleanupFailures: cleanup.failures
@@ -146,8 +222,8 @@ private actor CaptureSessionLifecycle {
             deviceID: plan.deviceID,
             capabilityRevision: plan.capabilityRevision
         )
-        let configuration = try preferredConfiguration(
-            snapshot.capabilities
+        let configuration = try plan.device.configuration(
+            for: snapshot.capabilities
         )
 
         let configured = try await configuredSnapshot(
@@ -160,13 +236,16 @@ private actor CaptureSessionLifecycle {
             capabilityRevision: plan.capabilityRevision
         )
 
-        let sink = CaptureSessionSampleSink(
-            delivery: plan.delivery,
-            connection: plan.connection
+        let request = try streamRequest(
+            configuration: configuration,
+            videoConnectionConfiguration:
+                plan.videoConnectionConfiguration,
+            capabilities: configured.capabilities
         )
+        let sink = CaptureSessionSampleSink(routes: plan.routes)
         let stream = try await captureStream(
             handle: handle,
-            configuration: configuration,
+            request: request,
             sink: sink
         )
         guard stream.deviceID == plan.deviceID else {
@@ -176,19 +255,39 @@ private actor CaptureSessionLifecycle {
             )
         }
         resources.stream = stream
+        try installRuntimeEventSink(
+            on: stream,
+            request: request,
+            capabilities: configured.capabilities
+        )
         try await start(stream: stream)
     }
 
     func stop() async throws(AVCaptureSessionError) {
+        let resources = state.withLock {
+            state -> CaptureSessionResources? in
+            guard state.phase == .running,
+                  let resources = state.resources else {
+                return nil
+            }
+            state.phase = .stopping
+            return resources
+        }
         guard let resources else {
-            return
+            throw .sessionBusy
         }
         let cleanup = await clean(resources)
         if cleanup.failures.isEmpty {
-            self.resources = nil
+            state.withLock { state in
+                state.resources = nil
+                state.phase = .idle
+            }
             return
         }
-        self.resources = cleanup.resources
+        state.withLock { state in
+            state.resources = cleanup.resources
+            state.phase = .running
+        }
         throw .stopFailures(cleanup.failures)
     }
 
@@ -224,29 +323,79 @@ private actor CaptureSessionLifecycle {
         }
     }
 
-    private func preferredConfiguration(
-        _ capabilities: CaptureDeviceCapabilities
-    ) throws(AVCaptureSessionRuntimeFailure) -> CaptureDeviceConfiguration {
-        do {
-            return try capabilities.preferredConfiguration()
-        } catch {
-            throw .contract(error)
-        }
-    }
-
     private func captureStream(
         handle: any CaptureDeviceHandle,
-        configuration: CaptureDeviceConfiguration,
+        request: CaptureStreamRequest,
         sink: any CaptureSampleSink
     ) async throws(AVCaptureSessionRuntimeFailure) -> any CaptureStream {
         do {
             return try await handle.stream(
-                for: CaptureStreamRequest(configuration: configuration),
+                for: request,
                 sink: sink
             )
         } catch {
             throw .driver(operation: .streaming, error: error)
         }
+    }
+
+    private func streamRequest(
+        configuration: CaptureDeviceConfiguration,
+        videoConnectionConfiguration: CaptureVideoConnectionConfiguration,
+        capabilities: CaptureDeviceCapabilities
+    ) throws(AVCaptureSessionRuntimeFailure) -> CaptureStreamRequest {
+        let request = CaptureStreamRequest(
+            configuration: configuration,
+            videoConnectionConfiguration: videoConnectionConfiguration
+        )
+        if capabilities.streams.isEmpty,
+           videoConnectionConfiguration == .unchanged {
+            return request
+        }
+        do {
+            return try capabilities.validatedStreamRequest(request)
+        } catch {
+            throw .driver(operation: .streaming, error: error)
+        }
+    }
+
+    private func installRuntimeEventSink(
+        on stream: any CaptureStream,
+        request: CaptureStreamRequest,
+        capabilities: CaptureDeviceCapabilities
+    ) throws(AVCaptureSessionRuntimeFailure) {
+        let expected = Self.eventCapabilities(
+            for: request,
+            in: capabilities
+        )
+        guard stream.eventCapabilities == expected else {
+            throw .streamEventCapabilitiesMismatch(
+                expected: expected,
+                actual: stream.eventCapabilities
+            )
+        }
+        guard !expected.isEmpty else {
+            return
+        }
+        runtimeEvents.setEventCapabilities(expected)
+        do {
+            try stream.setEventSink(runtimeEvents)
+        } catch {
+            throw .driver(operation: .streaming, error: error)
+        }
+    }
+
+    private static func eventCapabilities(
+        for request: CaptureStreamRequest,
+        in capabilities: CaptureDeviceCapabilities
+    ) -> CaptureStreamEventCapabilities {
+        if let streamID = request.streamID {
+            return capabilities.streams.first {
+                $0.streamID == streamID
+            }?.eventCapabilities ?? []
+        }
+        return capabilities.streams.first {
+            $0.formatIDs.contains(request.configuration.formatID)
+        }?.eventCapabilities ?? []
     }
 
     private func start(

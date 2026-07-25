@@ -2,12 +2,13 @@
 
 ## Status
 
-This document is the normative design for the package. The package is currently
-at **basic capture-graph smoke stage**: discovery feeds a one-device-input /
-one-video-output graph, configuration commits atomically, and session start
-drives the Driver handle through snapshot, preferred configuration, stream
-creation, and sample delivery. Multi-output fan-out and bounded backpressure
-remain unimplemented. Import or build success is not evidence of working capture.
+This document is the normative design for the package. The package has completed
+the capture-graph smoke stage: discovery feeds a one-device-input /
+multiple-video-output graph, configuration commits are failure-atomic for the
+session graph, and session start drives the Driver handle through snapshot,
+selected configuration, stream
+creation, bounded fan-out, and sample delivery. Import or build success is not
+evidence of working capture.
 
 ## Apple API review
 
@@ -42,7 +43,7 @@ operations.
 
 Apple's model is a graph. Devices are found through discovery rather than directly
 constructed. Device inputs expose media ports. Connections map compatible ports
-to outputs. A capture session atomically configures and runs the graph.
+to outputs. A capture session configures and runs the graph.
 
 ### Portable API differences
 
@@ -54,16 +55,40 @@ claim every Objective-C execution convention:
   configuration methods use typed `throws`; Native/WASM start and stop use
   `async throws` because Driver I/O suspends.
 - Embedded start and stop preserve the same names with synchronous typed throws,
-  matching the owner-isolated synchronous Driver contract.
+  matching the synchronous Driver contract without weakening `Sendable` or
+  synchronization requirements.
 - `AVCaptureInput.Port` has stable reference identity. Native/WASM use a weak
   back-reference to their input; Embedded Swift has no weak references, so its
-  owner-isolated contract requires a port not to outlive the input that vends it.
+  explicit lifetime contract requires a port not to outlive the input that
+  vends it.
+- `AVCaptureConnection` uses the same immutable strong output reference on every
+  target. Graph removal and graph destruction clear published output
+  connections before endpoint ownership is released.
 - Apple's `setSampleBufferDelegate(_:queue:)` requires Dispatch. The shared
   target instead provides `setSampleBufferDelegate(_:)`; Driver `offer` invokes
-  the delegate synchronously and in Driver stream order.
-- The current graph intentionally supports one `AVCaptureDeviceInput` and one
-  `AVCaptureVideoDataOutput`. `canAddInput` / `canAddOutput` return `false` past
-  that limit, and mutation reports a typed failure.
+  the `Sendable` delegate through the same synchronous bounded delivery path on
+  Native, WASM, and Embedded. It never invokes the delegate while holding
+  framework state locks.
+- Apple's dropped-sample callback carries a `CMSampleBuffer`. A portable Driver
+  source-drop event has no media buffer, so the shared delegate overload carries
+  `CaptureStreamDropEvent` instead of manufacturing a fake sample. The same
+  metadata value reaches session runtime state and each connected video output
+  in graph order, with every callback outside locks.
+- Apple exposes nonoptional connection orientation/stabilization values and
+  defaults stabilization to `.off` and automatic mirroring to `true`.
+  OpenAVFoundation exposes the same basic property names with portable enums;
+  `videoOrientation` is optional because `.nil` explicitly means provider
+  preservation. Untouched connection configuration remains `.unchanged`.
+  Reading the other two properties reports Apple's `.off`/automatic defaults;
+  assigning any property stages an explicit policy for the next session start.
+- `resolvedFormats()` explicitly opens a short-lived Driver handle to obtain a
+  revision-consistent capability snapshot. `select(format:frameRate:)` stages
+  the configuration that the session applies to its own handle at start. This
+  differs from Apple's synchronous `formats` property and immediate hardware
+  configuration lock because discovery must not open hardware implicitly.
+- The graph supports one `AVCaptureDeviceInput` and multiple
+  `AVCaptureVideoDataOutput` values. Every output receives the same retained
+  sample object through its own connection and bounded delivery state.
 
 These differences are explicit compatibility boundaries, not silent fallbacks.
 
@@ -94,7 +119,7 @@ OpenAVFoundation owns:
 - capture inputs and their media ports;
 - capture outputs and their delivery policies;
 - input-to-output connections;
-- atomic session graph configuration;
+- failure-atomic session graph mutation;
 - session lifecycle, interruption, and runtime failure;
 - opening each selected source once;
 - fan-out from one source to multiple outputs;
@@ -147,9 +172,13 @@ AVCaptureSession owns configuration, connection formation, source opening,
 runtime ordering, fan-out, shutdown, and failure propagation.
 ```
 
-`beginConfiguration()` and `commitConfiguration()` form an atomic graph
-transaction. An invalid graph is rejected without partially mutating the running
-graph.
+`beginConfiguration()` and `commitConfiguration()` form a failure-atomic graph
+transaction: an invalid graph is rejected without partially replacing the
+committed session graph. Public graph and output accessors each return a
+synchronized method-level snapshot. The package does not claim one linearizable
+snapshot across separate concurrent calls to `session.connections` and
+`output.connections`; applications must serialize configuration against related
+multi-object reads when they require one cross-object observation point.
 
 ## Device-driver contract
 
@@ -163,7 +192,7 @@ model.
 | Authorization | Report/request platform access | Expose compatible authorization state |
 | Open | Produce an exclusive or shared source handle | Enforce session ownership and lifecycle |
 | Formats | Describe supported media streams and controls | Validate requested session configuration |
-| Configuration | Apply a validated configuration transaction | Implement lock and atomicity semantics |
+| Configuration | Apply a validated configuration transaction | Implement failure-atomic graph replacement |
 | Streaming | Produce leased `CMSampleBuffer` values or typed failures | Route, correlate, fan out, and apply backpressure |
 | Shutdown | Stop production and release device resources | Order shutdown and finish all output streams |
 
@@ -188,11 +217,13 @@ There is no automatic fake fallback. If no driver supports a discovery request,
 the result is an empty device list. If a selected device fails to open, session
 start fails explicitly.
 
-The registry is an actor. It snapshots its short in-memory provider list and
-passes that immutable snapshot to a nonisolated discovery operation before any
-provider I/O suspends. Provider I/O therefore never runs while synchronously
-accessing registry state. Active driver replacement is rejected. Dynamic plugin
-loading is not required for Embedded Swift.
+The registry uses `Mutex<State>` on Native, WASM, and Embedded. Its bounded,
+ordered provider and stable-device caches use entry arrays rather than keyed
+containers. It snapshots the short in-memory provider list before provider I/O
+begins, then resolves stable device identity under a second short lock after I/O
+completes. Provider I/O therefore never runs while registry state is locked.
+Active driver replacement is rejected. Dynamic plugin loading is not required
+for Embedded Swift.
 
 The smoke-stage `AVCaptureDeviceRegistry.discoverySession(...)` operation is an
 async composition API that returns an immutable
@@ -200,10 +231,20 @@ async composition API that returns an immutable
 Apple discovery-session initializer; adding that declaration requires a
 separate refresh and snapshot-observation contract.
 
-Embedded Swift uses the driver's synchronous owner-isolated provider contract.
-Its registry performs the same explicit registration, filtering, identity, and
-typed-failure checks without actor isolation because the owner controls all
-access. It dynamically loads no provider and performs no implicit fallback.
+Embedded Swift uses the driver's synchronous `Sendable` provider contract. Its
+registry protects the same provider, ordering, and device-identity state with
+`Mutex`, snapshots providers before I/O, and performs the same explicit
+registration, filtering, identity, and typed-failure checks without assuming
+single-threaded execution. It dynamically loads no provider and performs no
+implicit fallback.
+
+Provider registrations, stable device identities, and discovered device IDs are
+bounded metadata and retain provider order. Lookup and duplicate validation use
+ordered array membership scans on every target. This is semantically equivalent
+for these small collections and avoids the fixed 2026-07-17 regular WASM
+runtime's failing keyed-container metadata paths. It is not a platform branch
+and does not change storage choices for payloads or genuinely large dynamic
+collections.
 
 ## Source and output contract
 
@@ -215,13 +256,18 @@ Source sample
      │ same sequence ID, source timestamp, format revision
      ├── AVCaptureVideoDataOutput
      ├── encoded/file output
-     └── Open observation output extension
+     └── future Open observation output extension
 ```
 
-Each output has an independent bounded delivery policy. A slow observation
-consumer cannot retain all camera buffers or stall a real-time video consumer.
-Frame dropping is observable and includes a typed reason. Buffer leases are
-released when every routed consumer has completed or dropped the sample.
+Each output has independent bounded queue and drop state. Fan-out currently
+visits output routes in graph order, so a synchronous delegate can delay later
+routes in the same source `offer`; the package does not claim cross-output
+parallel delegate execution. Concurrent or reentrant offers are either queued
+within the configured bound or dropped by policy. Frame dropping is observable
+through `droppedSampleCount` and `lastDropReason`. A circular slot queue clears
+each dequeued slot before invoking the delegate, so completed samples are not
+retained until a later drain finishes. Buffer leases are released when every
+routed consumer has completed or dropped the sample.
 
 The sample-routing path is zero-copy by contract. The registry owns only small
 device descriptors and provider references; it never owns, converts, or caches
@@ -231,16 +277,38 @@ payloads as `Array`, `Data`, or another copied representation. Any unavoidable
 copy belongs at an explicit external or persistence boundary and requires
 documented justification plus allocation or copy-count verification.
 
-The observation output is an OpenAVFoundation extension, not an Apple API claim.
-It accepts an injected processor and emits structured timed samples. It does not
-import Manas or select an inference model.
+### Runtime events and connection policy
+
+An event-capable Driver stream installs the session-owned
+`CaptureSessionRuntimeEventHub` before the stream starts. The hub translates
+ordered Driver interruption, resume, pressure, source-drop, and terminal-failure
+events into `AVCaptureSessionRuntimeEvent` and synchronized
+`AVCaptureSessionRuntimeState`. It mutates only bounded metadata while holding
+its Mutex, snapshots the application sink, and invokes that sink after releasing
+the lock. Source-drop events carry timing and counters only; they do not create
+or copy a media buffer. Stream shutdown clears the Driver sink.
+
+Each `AVCaptureConnection` stores one Mutex-protected
+`CaptureVideoConnectionConfiguration`. Start snapshots the committed
+connections, requires all fan-out connections for the single source stream to
+request the same policy, validates that policy against the selected stream
+descriptor, and passes it through `CaptureStreamRequest`. Unsupported
+orientation, stabilization, or mirroring remains a typed Driver failure rather
+than a no-op.
+
+An observation output is a future OpenAVFoundation extension, not an Apple API
+claim. No callable declaration exists in this package yet. When introduced, it
+will accept an injected processor and emit structured timed samples without
+importing Manas or selecting an inference model.
 
 ## Concurrency and lifecycle
 
-Native/WASM Driver-resource transitions use an internal actor because opening,
-starting, stopping, and rollback may suspend and order matters. Synchronous graph
-state uses a short `Mutex` critical section and performs no Driver I/O while
-locked. Embedded uses an owner-isolated synchronous state machine.
+Native/WASM and Embedded Driver-resource transitions reserve the same
+`Mutex<State>` phase/resource state machine. Native/WASM operations suspend only
+after reserving a phase and releasing the lock; Embedded performs the equivalent
+synchronous operation outside the lock. Synchronous graph state also uses short
+`Mutex` critical sections and performs no Driver or nested input/output operation
+while locked.
 
 ```text
 idle → configuring → starting → running → stopping → idle
@@ -255,9 +323,81 @@ Rules:
 3. Partial start failure closes resources already opened.
 4. Stop finishes output streams and releases all buffer leases.
 5. Runtime driver failure transitions the session to a visible failure state.
+   A stream event outside the capability set advertised for that stream is a
+   visible typed terminal failure, never a silent stop request.
 6. An `AsyncStream`-based extension exposes explicit shutdown and finishes its
    continuation.
 7. No callback or event is emitted while holding a mutex.
+
+### Shared-state review matrix
+
+| Logical state | Native | WASM | Embedded | Read/mutation entry points | Release |
+|---|---|---|---|---|---|
+| Provider registry | `Mutex<Registry.State>` | `Mutex<Registry.State>` | `Mutex<Registry.State>` | snapshot/resolve under `withLock`; provider I/O outside | registry owner |
+| Device selection | `Mutex<ConfigurationState>` | `Mutex<ConfigurationState>` | `Mutex<ConfigurationState>` | format read/select/configure under `withLock` | device owner |
+| Session graph | `Mutex<Graph.State>` | `Mutex<Graph.State>` | `Mutex<Graph.State>` | two-phase reservation; input/output ownership and connection publication outside graph lock | graph `deinit` releases endpoints after lock |
+| Session lifecycle | `Mutex<Lifecycle.State>` | `Mutex<Lifecycle.State>` | `Mutex<Lifecycle.State>` | reserve phase under `withLock`; all Driver I/O outside | stop/rollback closes stream then handle |
+| Output delivery | `Mutex<Delivery.State>` | `Mutex<Delivery.State>` | `Mutex<Delivery.State>` | bounded enqueue/dequeue under `withLock`; delegate outside | dequeued slot cleared before callback |
+| Runtime event state | `Mutex<EventHub.State>` | `Mutex<EventHub.State>` | `Mutex<EventHub.State>` | translate and snapshot sink under `withLock`; callback outside | session owner; Driver clears sink on shutdown |
+| Connection policy | `Mutex<Connection.State>` | `Mutex<Connection.State>` | `Mutex<Connection.State>` | getter/setter and start snapshot under `withLock` | connection owner |
+
+The Native/WASM asynchronous and Embedded synchronous Driver signatures are the
+only lifecycle shape difference. They do not change storage, isolation, phase,
+resource ownership, callback, or shutdown semantics.
+
+### Low-level reference ownership boundary
+
+Swift 6.4 `Synchronization.Mutex` accepts and returns `sending` values. A caller
+may continue to own Apple-shaped subclassable `AVCaptureInput` and
+`AVCaptureOutput` instances, so transferring those aliased non-`Sendable`
+references into or out of a Mutex fails region-isolation checking. Mutex can
+isolate a non-`Sendable` payload that is exclusively transferred to it; it
+cannot turn an externally aliased class reference into a checked `Sendable`
+value.
+
+The implementation therefore has two narrow immutable wrappers,
+`CaptureInputReference` and `CaptureOutputReference`. Their
+`nonisolated(unsafe)` stored references are the only strong-reference escape
+from compiler-derived `Sendable` checking in the graph and delivery path.
+`AVCaptureConnection` and queued delivery items reuse `CaptureOutputReference`
+instead of declaring additional unsafe fields.
+
+The wrapper invariants are:
+
+- The committed/draft graph is the owner of endpoint lifetime. ARC performs
+  deallocation; there is no manual allocation, rebinding, or pointer escape.
+- Wrapper references are initialized once and never replaced or mutated.
+- Every framework-owned mutable property of the referenced input/output uses
+  its own `Mutex<State>` entry point.
+- Graph mutation claims and publishes endpoints outside the graph lock.
+- Delivery dequeues its retained wrapper before calling the external delegate;
+  no callback, Driver I/O, or nested endpoint mutation occurs while the graph
+  or delivery lock is held.
+- A connection strongly retains its output on all targets. Output connection
+  publication creates a temporary output → connection → output cycle. Removing
+  an output and graph `deinit` both call `replaceConnections([])` before
+  releasing endpoint ownership, which breaks that cycle.
+
+`AVCaptureInput.Port` is a separate non-owning lifetime boundary. Native/WASM
+uses a weak reference and the behavior test proves that a stable port does not
+retain its input. Embedded lacks weak references, so it uses one immutable
+`unowned(unsafe)` reference. The input owns all ports it vends, and valid
+Embedded graphs retain the input for every port read. The Embedded WASM runtime
+smoke exercises discovery, graph construction, connection validation, sample
+delivery, and shutdown while that invariant is live. Accessing an escaped port
+after its input is released violates the public lifetime contract.
+
+These unsafe annotations are ownership interoperation boundaries, not a
+performance claim. Behavior evidence maps to the invariants as follows:
+
+| Invariant | Evidence |
+|---|---|
+| Same connection/output identity | Same-object fan-out and runtime sample-identity smoke |
+| Cycle and ownership release | Session-destruction reuse test and output connection clearing |
+| Callback outside delivery lock | Delegate reentry test |
+| Graph exclusivity | Concurrent 16-session commit test |
+| Lifecycle exclusivity | Concurrent start test |
+| Port non-retention / valid Embedded lifetime | Native stable-port release test / Embedded WASM runtime smoke |
 
 ## Platform model
 
@@ -298,7 +438,7 @@ become replay or synthetic devices without explicit application configuration.
 3. Implement a replay driver package and use it to test discovery and lifecycle.
 4. Implement `AVMediaType`, device types, positions, formats, and discovery.
 5. Implement device input, ports, output, and connection compatibility.
-6. Implement atomic session graph configuration.
+6. Implement failure-atomic session graph configuration.
 7. Implement start, sample routing, backpressure, failure, and shutdown.
 8. Implement video data output over `CMSampleBuffer` and `CVPixelBuffer`.
 9. Implement browser WASM and Embedded reference drivers.

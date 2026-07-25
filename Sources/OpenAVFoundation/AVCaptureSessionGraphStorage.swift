@@ -1,10 +1,8 @@
-#if !hasFeature(Embedded)
 import Synchronization
-#endif
 
 final class CaptureSessionOwner: Sendable {}
 
-enum CaptureSessionPhase {
+enum CaptureSessionPhase: Sendable {
     case idle
     case starting
     case running
@@ -12,58 +10,60 @@ enum CaptureSessionPhase {
     case cleanupRequired
 }
 
-struct CaptureSessionGraph {
+struct CaptureSessionGraph: Sendable {
     var inputs: [CaptureInputReference] = []
     var outputs: [CaptureOutputReference] = []
     var connections: [AVCaptureConnection] = []
 }
 
 struct CaptureInputReference: Sendable {
+    // AVCaptureInput is subclassable, so checked conformance is impossible.
+    // This wrapper is the graph's only strong input-reference Sendable
+    // boundary. The retained instance's framework-owned mutable state is
+    // independently Mutex-protected, and the wrapper never mutates the
+    // reference.
     nonisolated(unsafe) let value: AVCaptureInput
 }
 
 struct CaptureOutputReference: Sendable {
+    // AVCaptureOutput is subclassable, so checked conformance is impossible.
+    // Graph, connection, and queued-delivery values share this immutable
+    // wrapper instead of declaring additional unsafe reference boundaries.
+    // Framework-owned output state remains Mutex-protected.
     nonisolated(unsafe) let value: AVCaptureOutput
 }
 
-struct CaptureSessionStartPlan {
+struct CaptureSessionStartPlan: Sendable {
+    let device: AVCaptureDevice
     let deviceID: CaptureDeviceID
     let capabilityRevision: UInt64
     let opener: CaptureDeviceHandleOpener
+    let routes: [CaptureSessionOutputRoute]
+    let videoConnectionConfiguration: CaptureVideoConnectionConfiguration
+}
+
+struct CaptureSessionOutputRoute: Sendable {
     let delivery: VideoOutputDelivery
     let connection: AVCaptureConnection
 }
 
-#if !hasFeature(Embedded)
-extension CaptureSessionStartPlan: Sendable {}
-#endif
-
-final class AVCaptureSessionGraphStorage {
-    private struct State {
+final class AVCaptureSessionGraphStorage: Sendable {
+    private struct State: Sendable {
         var committed = CaptureSessionGraph()
         var draft: CaptureSessionGraph?
         var phase = CaptureSessionPhase.idle
+        var operationInProgress = false
     }
 
     private let owner = CaptureSessionOwner()
-
-#if hasFeature(Embedded)
-    private var state = State()
-#else
     private let state = Mutex(State())
-#endif
 
     private var ownerID: ObjectIdentifier {
         ObjectIdentifier(owner)
     }
 
     deinit {
-        let graph: CaptureSessionGraph
-#if hasFeature(Embedded)
-        graph = state.committed
-#else
-        graph = state.withLock { state in state.committed }
-#endif
+        let graph = state.withLock { state in state.committed }
         // Release nested object ownership only after leaving the graph lock.
         for output in graph.outputs {
             output.value.replaceConnections([])
@@ -75,265 +75,122 @@ final class AVCaptureSessionGraphStorage {
     }
 
     var inputs: [AVCaptureInput] {
-#if hasFeature(Embedded)
-        state.committed.inputs.map { reference in
-            reference.value
-        }
-#else
         state.withLock { state in
             state.committed.inputs.map { reference in
                 reference.value
             }
         }
-#endif
     }
 
     var outputs: [AVCaptureOutput] {
-#if hasFeature(Embedded)
-        state.committed.outputs.map { reference in
-            reference.value
-        }
-#else
         state.withLock { state in
             state.committed.outputs.map { reference in
                 reference.value
             }
         }
-#endif
     }
 
     var connections: [AVCaptureConnection] {
-#if hasFeature(Embedded)
-        state.committed.connections
-#else
         state.withLock { state in state.committed.connections }
-#endif
     }
 
     var isRunning: Bool {
-#if hasFeature(Embedded)
-        state.phase == .running
-#else
         state.withLock { state in state.phase == .running }
-#endif
     }
 
     func beginConfiguration() throws(AVCaptureSessionError) {
-#if hasFeature(Embedded)
-        try Self.beginConfiguration(state: &state)
-#else
         try state.withLock { state throws(AVCaptureSessionError) in
-            try Self.beginConfiguration(state: &state)
+            guard !state.operationInProgress else {
+                throw .sessionBusy
+            }
+            guard state.phase == .idle else {
+                throw .configurationWhileRunningUnsupported
+            }
+            guard state.draft == nil else {
+                throw .configurationAlreadyActive
+            }
+            state.draft = state.committed
         }
-#endif
     }
 
     func commitConfiguration() throws(AVCaptureSessionError) {
-#if hasFeature(Embedded)
-        try Self.commitConfiguration(
-            state: &state,
-            ownerID: ownerID
-        )
-#else
-        try state.withLock { state throws(AVCaptureSessionError) in
-            try Self.commitConfiguration(
-                state: &state,
-                ownerID: ownerID
-            )
-        }
-#endif
-    }
-
-    func canAddInput(_ input: AVCaptureInput) -> Bool {
-#if hasFeature(Embedded)
-        Self.canAddInput(input, state: state, ownerID: ownerID)
-#else
-        nonisolated(unsafe) let input = input
-        return state.withLock { state in
-            Self.canAddInput(input, state: state, ownerID: ownerID)
-        }
-#endif
-    }
-
-    func addInput(
-        _ input: AVCaptureInput
-    ) throws(AVCaptureSessionError) {
-#if hasFeature(Embedded)
-        try Self.addInput(input, state: &state, ownerID: ownerID)
-#else
-        nonisolated(unsafe) let input = input
-        try state.withLock { state throws(AVCaptureSessionError) in
-            try Self.addInput(input, state: &state, ownerID: ownerID)
-        }
-#endif
-    }
-
-    func removeInput(
-        _ input: AVCaptureInput
-    ) throws(AVCaptureSessionError) {
-#if hasFeature(Embedded)
-        try Self.removeInput(input, state: &state, ownerID: ownerID)
-#else
-        nonisolated(unsafe) let input = input
-        try state.withLock { state throws(AVCaptureSessionError) in
-            try Self.removeInput(input, state: &state, ownerID: ownerID)
-        }
-#endif
-    }
-
-    func canAddOutput(_ output: AVCaptureOutput) -> Bool {
-#if hasFeature(Embedded)
-        Self.canAddOutput(output, state: state, ownerID: ownerID)
-#else
-        nonisolated(unsafe) let output = output
-        return state.withLock { state in
-            Self.canAddOutput(output, state: state, ownerID: ownerID)
-        }
-#endif
-    }
-
-    func addOutput(
-        _ output: AVCaptureOutput
-    ) throws(AVCaptureSessionError) {
-#if hasFeature(Embedded)
-        try Self.addOutput(output, state: &state, ownerID: ownerID)
-#else
-        nonisolated(unsafe) let output = output
-        try state.withLock { state throws(AVCaptureSessionError) in
-            try Self.addOutput(output, state: &state, ownerID: ownerID)
-        }
-#endif
-    }
-
-    func removeOutput(
-        _ output: AVCaptureOutput
-    ) throws(AVCaptureSessionError) {
-#if hasFeature(Embedded)
-        try Self.removeOutput(output, state: &state, ownerID: ownerID)
-#else
-        nonisolated(unsafe) let output = output
-        try state.withLock { state throws(AVCaptureSessionError) in
-            try Self.removeOutput(output, state: &state, ownerID: ownerID)
-        }
-#endif
-    }
-
-    func prepareToStart()
-        throws(AVCaptureSessionError) -> CaptureSessionStartPlan
-    {
-#if hasFeature(Embedded)
-        try Self.prepareToStart(state: &state)
-#else
-        try state.withLock { state throws(AVCaptureSessionError) in
-            try Self.prepareToStart(state: &state)
-        }
-#endif
-    }
-
-    func finishStart(cleanupRequired: Bool) {
-#if hasFeature(Embedded)
-        state.phase = cleanupRequired ? .cleanupRequired : .idle
-#else
-        state.withLock { state in
-            state.phase = cleanupRequired ? .cleanupRequired : .idle
-        }
-#endif
-    }
-
-    func finishStartSuccessfully() {
-#if hasFeature(Embedded)
-        state.phase = .running
-#else
-        state.withLock { state in state.phase = .running }
-#endif
-    }
-
-    func prepareToStop() throws(AVCaptureSessionError) -> Bool {
-#if hasFeature(Embedded)
-        try Self.prepareToStop(state: &state)
-#else
-        try state.withLock { state throws(AVCaptureSessionError) in
-            try Self.prepareToStop(state: &state)
-        }
-#endif
-    }
-
-    func finishStop(cleanupRequired: Bool) {
-#if hasFeature(Embedded)
-        state.phase = cleanupRequired ? .cleanupRequired : .idle
-#else
-        state.withLock { state in
-            state.phase = cleanupRequired ? .cleanupRequired : .idle
-        }
-#endif
-    }
-
-    private static func beginConfiguration(
-        state: inout State
-    ) throws(AVCaptureSessionError) {
-        guard state.phase == .idle else {
-            throw .configurationWhileRunningUnsupported
-        }
-        guard state.draft == nil else {
-            throw .configurationAlreadyActive
-        }
-        state.draft = state.committed
-    }
-
-    private static func commitConfiguration(
-        state: inout State,
-        ownerID: ObjectIdentifier
-    ) throws(AVCaptureSessionError) {
-        guard let draft = state.draft else {
-            throw .configurationNotActive
+        let graphs = try state.withLock {
+            state throws(AVCaptureSessionError)
+                -> (draft: CaptureSessionGraph, committed: CaptureSessionGraph) in
+            guard !state.operationInProgress else {
+                throw .sessionBusy
+            }
+            guard let draft = state.draft else {
+                throw .configurationNotActive
+            }
+            state.operationInProgress = true
+            // Preserve the existing contract: every commit attempt consumes
+            // the draft, including validation and ownership failures.
+            state.draft = nil
+            return (draft, state.committed)
         }
 
-        // A failed commit always discards its draft before reporting failure.
-        state.draft = nil
-        let validated = try validatedCompleteGraph(draft)
+        let validated: CaptureSessionGraph
+        do {
+            validated = try Self.validatedCompleteGraph(graphs.draft)
+        } catch {
+            finishOperation()
+            throw error
+        }
 
-        var newlyClaimedInputs: [AVCaptureInput] = []
+        var claimedInputs: [AVCaptureInput] = []
         for input in validated.inputs
-        where !containsIdentity(state.committed.inputs, input) {
+        where !Self.containsIdentity(graphs.committed.inputs, input) {
             guard input.value.claimOwnership(by: ownerID) else {
-                releaseInputs(newlyClaimedInputs, ownerID: ownerID)
+                Self.releaseInputs(claimedInputs, ownerID: ownerID)
+                finishOperation()
                 throw .inputOwnedByAnotherSession
             }
-            newlyClaimedInputs.append(input.value)
+            claimedInputs.append(input.value)
         }
 
-        var newlyClaimedOutputs: [AVCaptureOutput] = []
+        var claimedOutputs: [AVCaptureOutput] = []
         for output in validated.outputs
-        where !containsIdentity(state.committed.outputs, output) {
+        where !Self.containsIdentity(graphs.committed.outputs, output) {
             guard output.value.claimOwnership(by: ownerID) else {
-                releaseOutputs(newlyClaimedOutputs, ownerID: ownerID)
-                releaseInputs(newlyClaimedInputs, ownerID: ownerID)
+                Self.releaseOutputs(claimedOutputs, ownerID: ownerID)
+                Self.releaseInputs(claimedInputs, ownerID: ownerID)
+                finishOperation()
                 throw .outputOwnedByAnotherSession
             }
-            newlyClaimedOutputs.append(output.value)
+            claimedOutputs.append(output.value)
         }
 
-        let previous = state.committed
-        state.committed = validated
-        synchronizeOutputConnections(validated)
+        // Input/output locks and connection publication occur with the graph
+        // state lock released. operationInProgress prevents a second graph
+        // mutation from replacing this transaction. Each public accessor is a
+        // synchronized snapshot, but separate session/output accessor calls do
+        // not form one cross-object linearizable read.
+        Self.synchronizeOutputConnections(validated)
+        state.withLock { state in
+            state.committed = validated
+            state.operationInProgress = false
+        }
 
-        for input in previous.inputs
-        where !containsIdentity(validated.inputs, input) {
+        for input in graphs.committed.inputs
+        where !Self.containsIdentity(validated.inputs, input) {
             input.value.releaseOwnership(by: ownerID)
         }
-        for output in previous.outputs
-        where !containsIdentity(validated.outputs, output) {
+        for output in graphs.committed.outputs
+        where !Self.containsIdentity(validated.outputs, output) {
             output.value.replaceConnections([])
             output.value.releaseOwnership(by: ownerID)
         }
     }
 
-    private static func canAddInput(
-        _ input: AVCaptureInput,
-        state: State,
-        ownerID: ObjectIdentifier
-    ) -> Bool {
-        guard state.phase == .idle,
+    func canAddInput(_ input: AVCaptureInput) -> Bool {
+        let graph = state.withLock { state -> CaptureSessionGraph? in
+            guard !state.operationInProgress, state.phase == .idle else {
+                return nil
+            }
+            return state.draft ?? state.committed
+        }
+        guard let graph,
               input is AVCaptureDeviceInput,
               input.ports.contains(where: {
                   $0.mediaType == .video && $0.isEnabled
@@ -341,20 +198,14 @@ final class AVCaptureSessionGraphStorage {
         else {
             return false
         }
-        let graph = state.draft ?? state.committed
         return graph.inputs.isEmpty
-            && !containsIdentity(graph.inputs, input)
+            && !Self.containsIdentity(graph.inputs, input)
             && input.canBeOwned(by: ownerID)
     }
 
-    private static func addInput(
-        _ input: AVCaptureInput,
-        state: inout State,
-        ownerID: ObjectIdentifier
+    func addInput(
+        _ input: AVCaptureInput
     ) throws(AVCaptureSessionError) {
-        guard state.phase == .idle else {
-            throw .configurationWhileRunningUnsupported
-        }
         guard input is AVCaptureDeviceInput,
               input.ports.contains(where: {
                   $0.mediaType == .video && $0.isEnabled
@@ -363,195 +214,267 @@ final class AVCaptureSessionGraphStorage {
             throw .unsupportedInput
         }
 
-        if var draft = state.draft {
-            guard !containsIdentity(draft.inputs, input) else {
-                throw .duplicateInput
-            }
-            guard draft.inputs.isEmpty else {
-                throw .inputLimitReached
-            }
-            guard input.canBeOwned(by: ownerID) else {
-                throw .inputOwnedByAnotherSession
-            }
-            draft.inputs.append(CaptureInputReference(value: input))
-            state.draft = draft
-            return
-        }
-
-        guard !containsIdentity(state.committed.inputs, input) else {
+        let reserved = try reserveGraphMutation()
+        guard !Self.containsIdentity(reserved.graph.inputs, input) else {
+            finishOperation()
             throw .duplicateInput
         }
-        guard state.committed.inputs.isEmpty else {
+        guard reserved.graph.inputs.isEmpty else {
+            finishOperation()
             throw .inputLimitReached
         }
-        guard input.claimOwnership(by: ownerID) else {
-            throw .inputOwnedByAnotherSession
+
+        if reserved.usesDraft {
+            guard input.canBeOwned(by: ownerID) else {
+                finishOperation()
+                throw .inputOwnedByAnotherSession
+            }
+        } else {
+            guard input.claimOwnership(by: ownerID) else {
+                finishOperation()
+                throw .inputOwnedByAnotherSession
+            }
         }
-        state.committed.inputs.append(
-            CaptureInputReference(value: input)
-        )
-        state.committed = graphWithAutomaticConnections(state.committed)
-        synchronizeOutputConnections(state.committed)
+
+        var graph = reserved.graph
+        graph.inputs.append(CaptureInputReference(value: input))
+        if !reserved.usesDraft {
+            graph = Self.graphWithAutomaticConnections(graph)
+            Self.synchronizeOutputConnections(graph)
+        }
+        finishGraphMutation(graph, usesDraft: reserved.usesDraft)
     }
 
-    private static func removeInput(
-        _ input: AVCaptureInput,
-        state: inout State,
-        ownerID: ObjectIdentifier
+    func removeInput(
+        _ input: AVCaptureInput
     ) throws(AVCaptureSessionError) {
-        guard state.phase == .idle else {
-            throw .configurationWhileRunningUnsupported
+        let reserved = try reserveGraphMutation()
+        var graph = reserved.graph
+        let existed = Self.containsIdentity(graph.inputs, input)
+        graph.inputs.removeAll { $0.value === input }
+        graph.connections = []
+        if !reserved.usesDraft {
+            Self.synchronizeOutputConnections(graph)
         }
-        if var draft = state.draft {
-            draft.inputs.removeAll { $0.value === input }
-            draft.connections = []
-            state.draft = draft
-            return
-        }
-        let existed = containsIdentity(state.committed.inputs, input)
-        state.committed.inputs.removeAll { $0.value === input }
-        state.committed = graphWithAutomaticConnections(state.committed)
-        synchronizeOutputConnections(state.committed)
-        if existed {
+        finishGraphMutation(graph, usesDraft: reserved.usesDraft)
+        if existed && !reserved.usesDraft {
             input.releaseOwnership(by: ownerID)
         }
     }
 
-    private static func canAddOutput(
-        _ output: AVCaptureOutput,
-        state: State,
-        ownerID: ObjectIdentifier
-    ) -> Bool {
-        guard state.phase == .idle,
-              output is AVCaptureVideoDataOutput
-        else {
+    func canAddOutput(_ output: AVCaptureOutput) -> Bool {
+        let graph = state.withLock { state -> CaptureSessionGraph? in
+            guard !state.operationInProgress, state.phase == .idle else {
+                return nil
+            }
+            return state.draft ?? state.committed
+        }
+        guard let graph, output is AVCaptureVideoDataOutput else {
             return false
         }
-        let graph = state.draft ?? state.committed
-        return graph.outputs.isEmpty
-            && !containsIdentity(graph.outputs, output)
+        return !Self.containsIdentity(graph.outputs, output)
             && output.canBeOwned(by: ownerID)
     }
 
-    private static func addOutput(
-        _ output: AVCaptureOutput,
-        state: inout State,
-        ownerID: ObjectIdentifier
+    func addOutput(
+        _ output: AVCaptureOutput
     ) throws(AVCaptureSessionError) {
-        guard state.phase == .idle else {
-            throw .configurationWhileRunningUnsupported
-        }
         guard output is AVCaptureVideoDataOutput else {
             throw .unsupportedOutput
         }
-
-        if var draft = state.draft {
-            guard !containsIdentity(draft.outputs, output) else {
-                throw .duplicateOutput
-            }
-            guard draft.outputs.isEmpty else {
-                throw .outputLimitReached
-            }
-            guard output.canBeOwned(by: ownerID) else {
-                throw .outputOwnedByAnotherSession
-            }
-            draft.outputs.append(CaptureOutputReference(value: output))
-            state.draft = draft
-            return
-        }
-
-        guard !containsIdentity(state.committed.outputs, output) else {
+        let reserved = try reserveGraphMutation()
+        guard !Self.containsIdentity(reserved.graph.outputs, output) else {
+            finishOperation()
             throw .duplicateOutput
         }
-        guard state.committed.outputs.isEmpty else {
-            throw .outputLimitReached
+
+        if reserved.usesDraft {
+            guard output.canBeOwned(by: ownerID) else {
+                finishOperation()
+                throw .outputOwnedByAnotherSession
+            }
+        } else {
+            guard output.claimOwnership(by: ownerID) else {
+                finishOperation()
+                throw .outputOwnedByAnotherSession
+            }
         }
-        guard output.claimOwnership(by: ownerID) else {
-            throw .outputOwnedByAnotherSession
+
+        var graph = reserved.graph
+        graph.outputs.append(CaptureOutputReference(value: output))
+        if !reserved.usesDraft {
+            graph = Self.graphWithAutomaticConnections(graph)
+            Self.synchronizeOutputConnections(graph)
         }
-        state.committed.outputs.append(
-            CaptureOutputReference(value: output)
-        )
-        state.committed = graphWithAutomaticConnections(state.committed)
-        synchronizeOutputConnections(state.committed)
+        finishGraphMutation(graph, usesDraft: reserved.usesDraft)
     }
 
-    private static func removeOutput(
-        _ output: AVCaptureOutput,
-        state: inout State,
-        ownerID: ObjectIdentifier
+    func removeOutput(
+        _ output: AVCaptureOutput
     ) throws(AVCaptureSessionError) {
-        guard state.phase == .idle else {
-            throw .configurationWhileRunningUnsupported
+        let reserved = try reserveGraphMutation()
+        var graph = reserved.graph
+        let existed = Self.containsIdentity(graph.outputs, output)
+        graph.outputs.removeAll { $0.value === output }
+        graph = Self.graphWithAutomaticConnections(graph)
+        if !reserved.usesDraft {
+            Self.synchronizeOutputConnections(graph)
         }
-        if var draft = state.draft {
-            draft.outputs.removeAll { $0.value === output }
-            draft.connections = []
-            state.draft = draft
-            return
-        }
-        let existed = containsIdentity(state.committed.outputs, output)
-        state.committed.outputs.removeAll { $0.value === output }
-        state.committed = graphWithAutomaticConnections(state.committed)
-        synchronizeOutputConnections(state.committed)
-        if existed {
+        finishGraphMutation(graph, usesDraft: reserved.usesDraft)
+        if existed && !reserved.usesDraft {
             output.replaceConnections([])
             output.releaseOwnership(by: ownerID)
         }
     }
 
-    private static func prepareToStart(
-        state: inout State
-    ) throws(AVCaptureSessionError) -> CaptureSessionStartPlan {
-        guard state.draft == nil else {
-            throw .configurationInProgress
+    func prepareToStart()
+        throws(AVCaptureSessionError) -> CaptureSessionStartPlan
+    {
+        let graph = try state.withLock {
+            state throws(AVCaptureSessionError) -> CaptureSessionGraph in
+            guard !state.operationInProgress else {
+                throw .sessionBusy
+            }
+            guard state.draft == nil else {
+                throw .configurationInProgress
+            }
+            guard state.phase == .idle else {
+                throw .sessionBusy
+            }
+            state.operationInProgress = true
+            return state.committed
         }
-        guard state.phase == .idle else {
-            throw .sessionBusy
+
+        let validated: CaptureSessionGraph
+        do {
+            validated = try Self.validatedCompleteGraph(graph)
+        } catch {
+            finishOperation()
+            throw error
         }
-        let graph = try validatedCompleteGraph(state.committed)
-        state.committed = graph
-        synchronizeOutputConnections(graph)
-        state.phase = .starting
+        Self.synchronizeOutputConnections(validated)
 
         guard let input =
-                graph.inputs[0].value as? AVCaptureDeviceInput,
-              let output =
-                graph.outputs[0].value as? AVCaptureVideoDataOutput
+                validated.inputs[0].value as? AVCaptureDeviceInput
         else {
-            // validatedCompleteGraph guarantees these concrete types.
-            preconditionFailure("Validated capture graph lost its concrete types.")
+            finishOperation()
+            throw .unsupportedInput
+        }
+        var routes: [CaptureSessionOutputRoute] = []
+        routes.reserveCapacity(validated.connections.count)
+        for connection in validated.connections {
+            guard let output =
+                    connection.output as? AVCaptureVideoDataOutput else {
+                finishOperation()
+                throw .unsupportedOutput
+            }
+            routes.append(
+                CaptureSessionOutputRoute(
+                    delivery: output.deliveryEndpoint,
+                    connection: connection
+                )
+            )
+        }
+
+        let connectionConfiguration =
+            validated.connections[0].videoConnectionConfiguration
+        guard validated.connections.dropFirst().allSatisfy({
+            $0.videoConnectionConfiguration == connectionConfiguration
+        }) else {
+            finishOperation()
+            throw .incompatibleVideoConnectionConfigurations
+        }
+
+        state.withLock { state in
+            state.committed = validated
+            state.phase = .starting
+            state.operationInProgress = false
         }
         return CaptureSessionStartPlan(
+            device: input.device,
             deviceID: input.device.captureDeviceID,
             capabilityRevision: input.device.descriptor.capabilityRevision,
             opener: input.device.handleOpener,
-            delivery: output.deliveryEndpoint,
-            connection: graph.connections[0]
+            routes: routes,
+            videoConnectionConfiguration: connectionConfiguration
         )
     }
 
-    private static func prepareToStop(
-        state: inout State
-    ) throws(AVCaptureSessionError) -> Bool {
-        switch state.phase {
-        case .idle:
-            return false
-        case .running, .cleanupRequired:
-            state.phase = .stopping
-            return true
-        case .starting, .stopping:
-            throw .sessionBusy
+    private func reserveGraphMutation()
+        throws(AVCaptureSessionError)
+        -> (graph: CaptureSessionGraph, usesDraft: Bool)
+    {
+        try state.withLock { state throws(AVCaptureSessionError) in
+            guard !state.operationInProgress else {
+                throw .sessionBusy
+            }
+            guard state.phase == .idle else {
+                throw .configurationWhileRunningUnsupported
+            }
+            state.operationInProgress = true
+            if let draft = state.draft {
+                return (draft, true)
+            }
+            return (state.committed, false)
+        }
+    }
+
+    private func finishGraphMutation(
+        _ graph: CaptureSessionGraph,
+        usesDraft: Bool
+    ) {
+        state.withLock { state in
+            if usesDraft {
+                state.draft = graph
+            } else {
+                state.committed = graph
+            }
+            state.operationInProgress = false
+        }
+    }
+
+    private func finishOperation() {
+        state.withLock { state in
+            state.operationInProgress = false
+        }
+    }
+
+    func finishStart(cleanupRequired: Bool) {
+        state.withLock { state in
+            state.phase = cleanupRequired ? .cleanupRequired : .idle
+        }
+    }
+
+    func finishStartSuccessfully() {
+        state.withLock { state in state.phase = .running }
+    }
+
+    func prepareToStop() throws(AVCaptureSessionError) -> Bool {
+        try state.withLock { state throws(AVCaptureSessionError) in
+            guard !state.operationInProgress else {
+                throw .sessionBusy
+            }
+            switch state.phase {
+            case .idle:
+                return false
+            case .running, .cleanupRequired:
+                state.phase = .stopping
+                return true
+            case .starting, .stopping:
+                throw .sessionBusy
+            }
+        }
+    }
+
+    func finishStop(cleanupRequired: Bool) {
+        state.withLock { state in
+            state.phase = cleanupRequired ? .cleanupRequired : .idle
         }
     }
 
     private static func validatedCompleteGraph(
         _ graph: CaptureSessionGraph
     ) throws(AVCaptureSessionError) -> CaptureSessionGraph {
-        // FIXME(INCOMPLETE_IMPLEMENTATION): Session start currently routes one video
-        // device input to one video data output through this validator. It must
-        // not accept additional routes until source sharing, bounded fan-out,
-        // per-output backpressure, and lease release are implemented.
         guard !graph.inputs.isEmpty else {
             throw .missingInput
         }
@@ -561,14 +484,13 @@ final class AVCaptureSessionGraphStorage {
         guard !graph.outputs.isEmpty else {
             throw .missingOutput
         }
-        guard graph.outputs.count == 1 else {
-            throw .outputLimitReached
-        }
         guard graph.inputs[0].value is AVCaptureDeviceInput else {
             throw .unsupportedInput
         }
-        guard graph.outputs[0].value is AVCaptureVideoDataOutput else {
-            throw .unsupportedOutput
+        for output in graph.outputs {
+            guard output.value is AVCaptureVideoDataOutput else {
+                throw .unsupportedOutput
+            }
         }
         let videoPorts = graph.inputs[0].value.ports.filter {
             $0.mediaType == .video && $0.isEnabled
@@ -578,12 +500,13 @@ final class AVCaptureSessionGraphStorage {
         }
 
         var validated = graph
-        validated.connections = [
-            AVCaptureConnection(
+        validated.connections = graph.outputs.map { output in
+            Self.connection(
                 inputPorts: videoPorts,
-                output: graph.outputs[0].value
+                output: output.value,
+                preserving: graph.connections
             )
-        ]
+        }
         return validated
     }
 
@@ -591,9 +514,11 @@ final class AVCaptureSessionGraphStorage {
         _ graph: CaptureSessionGraph
     ) -> CaptureSessionGraph {
         guard graph.inputs.count == 1,
-              graph.outputs.count == 1,
+              !graph.outputs.isEmpty,
               graph.inputs[0].value is AVCaptureDeviceInput,
-              graph.outputs[0].value is AVCaptureVideoDataOutput
+              graph.outputs.allSatisfy({
+                  $0.value is AVCaptureVideoDataOutput
+              })
         else {
             var incomplete = graph
             incomplete.connections = []
@@ -608,13 +533,32 @@ final class AVCaptureSessionGraphStorage {
             return incomplete
         }
         var connected = graph
-        connected.connections = [
-            AVCaptureConnection(
+        connected.connections = graph.outputs.map { output in
+            Self.connection(
                 inputPorts: videoPorts,
-                output: graph.outputs[0].value
+                output: output.value,
+                preserving: graph.connections
             )
-        ]
+        }
         return connected
+    }
+
+    private static func connection(
+        inputPorts: [AVCaptureInput.Port],
+        output: AVCaptureOutput,
+        preserving existingConnections: [AVCaptureConnection]
+    ) -> AVCaptureConnection {
+        let connection = AVCaptureConnection(
+            inputPorts: inputPorts,
+            output: output
+        )
+        if let existing = existingConnections.first(where: {
+            $0.output === output
+        }) {
+            connection.videoConnectionConfiguration =
+                existing.videoConnectionConfiguration
+        }
+        return connection
     }
 
     private static func synchronizeOutputConnections(
@@ -675,7 +619,3 @@ final class AVCaptureSessionGraphStorage {
         }
     }
 }
-
-#if !hasFeature(Embedded)
-extension AVCaptureSessionGraphStorage: Sendable {}
-#endif

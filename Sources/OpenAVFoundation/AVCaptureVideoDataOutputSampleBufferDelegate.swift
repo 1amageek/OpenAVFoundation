@@ -1,12 +1,3 @@
-#if hasFeature(Embedded)
-public protocol AVCaptureVideoDataOutputSampleBufferDelegate: AnyObject {
-    func captureOutput(
-        _ output: AVCaptureOutput,
-        didOutput sampleBuffer: any CMSampleBuffer,
-        from connection: AVCaptureConnection
-    )
-}
-#else
 public protocol AVCaptureVideoDataOutputSampleBufferDelegate:
     AnyObject,
     Sendable
@@ -16,5 +7,18 @@ public protocol AVCaptureVideoDataOutputSampleBufferDelegate:
         didOutput sampleBuffer: any CMSampleBuffer,
         from connection: AVCaptureConnection
     )
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didDrop event: CaptureStreamDropEvent,
+        from connection: AVCaptureConnection
+    )
 }
-#endif
+
+public extension AVCaptureVideoDataOutputSampleBufferDelegate {
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didDrop event: CaptureStreamDropEvent,
+        from connection: AVCaptureConnection
+    ) {}
+}
