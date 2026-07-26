@@ -105,7 +105,7 @@ stable AVCaptureDevice identity cache
 | Device configuration | Implemented | Explicit capability resolution, format selection, and frame-rate validation |
 | Device controls | Implemented | Atomic control staging plus foreign, stale, unsupported, and partial-update preservation tests |
 | Multi-output fan-out | Implemented | Same-object graph-ordered routing with independent bounded queue/drop state |
-| Backpressure | Implemented | Configurable bounded pending count and observable typed drop reason |
+| Backpressure | Implemented | Preallocated fixed-capacity queue, 8-sample portable bound, post-lock eviction release, and observable typed drop reason |
 | Shared-state parity | Implemented | Native/WASM/Embedded registry, graph, lifecycle, device, and delivery matrix use the same Mutex storage contract |
 | Reentry and contention | Implemented | Provider reentry, delegate reentry, concurrent commit, and concurrent start behavior tests |
 | Discovery duplicate validation | Implemented | Ordered bounded metadata scan on all targets; no regular-WASM `Set.insert` dependency |
@@ -125,10 +125,11 @@ The cross-target runs use
 
 | Target | Command | Result |
 |---|---|---|
-| macOS behavior smoke | `xcodebuild test -scheme OpenAVFoundation -destination 'platform=macOS' -maximum-test-execution-time-allowance 60 CODE_SIGNING_ALLOWED=NO` | Passed on 2026-07-25: 33 tests |
-| macOS Thread Sanitizer | Same command with `-enableThreadSanitizer YES` | Passed on 2026-07-25: 33 tests |
-| WASM shared build | Exact snapshot `swift build --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm --target OpenAVFoundation` | Passed on 2026-07-25 |
-| Embedded WASM shared build | Exact snapshot `swift build --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm-embedded --target OpenAVFoundation` | Passed on 2026-07-25 |
+| macOS behavior smoke | `xcodebuild test -scheme OpenAVFoundation -destination 'platform=macOS' -maximum-test-execution-time-allowance 60 CODE_SIGNING_ALLOWED=NO` | Passed on 2026-07-26: 37 tests |
+| macOS Address Sanitizer | Same command with `-enableAddressSanitizer YES` | Passed on 2026-07-26: 37 tests with zero findings |
+| macOS Thread Sanitizer | Same command with `-enableThreadSanitizer YES` | Passed on 2026-07-26: 37 tests with zero race findings; the Xcode beta emitted its known dyld module-map warning |
+| WASM shared build | Exact snapshot `swift build --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm --target OpenAVFoundation` | Passed on 2026-07-26 against OpenCoreMedia `e5495c7` |
+| Embedded WASM shared build | Exact snapshot `swift build --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm-embedded --target OpenAVFoundation` | Passed on 2026-07-26 against OpenCoreMedia `e5495c7` |
 | WASM callable runtime | External fixture: register, discover, resolve formats, stage zoom, build graph, receive pressure event and the identical sample object, stop, and destroy resources | Passed on 2026-07-25 with the final remote dependency revisions |
 | Embedded WASM callable runtime | Same external fixture with the matching Embedded SDK and explicit Unicode data-table link | Passed on 2026-07-25 with the final remote dependency revisions |
 | Published dependency resolution | `swift package update` followed by fresh external runtime builds | Resolves Driver `d4b8a8c`, CoreMedia `07bd447`, and CoreVideo `6861652`; `Package.swift` contains URL dependencies only |
@@ -171,4 +172,8 @@ external delegates without holding framework locks. Each output owns independent
 bounded queue/drop state, while route traversal remains graph ordered rather
 than cross-output parallel. Dequeue clears its circular storage slot before
 delegate invocation, retaining only the active sample plus the configured number
-of pending sample leases. No target decodes or materializes payload bytes.
+of pending sample leases. The first active delivery does not consume pending
+capacity. Source-drop callbacks use the same serial drain. Reconfiguration
+allocates replacement storage outside the delivery mutex, and shrinking the
+bound releases evicted leases after unlocking. No target decodes or materializes
+payload bytes.

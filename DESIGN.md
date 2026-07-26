@@ -262,12 +262,16 @@ Source sample
 Each output has independent bounded queue and drop state. Fan-out currently
 visits output routes in graph order, so a synchronous delegate can delay later
 routes in the same source `offer`; the package does not claim cross-output
-parallel delegate execution. Concurrent or reentrant offers are either queued
-within the configured bound or dropped by policy. Frame dropping is observable
-through `droppedSampleCount` and `lastDropReason`. A circular slot queue clears
-each dequeued slot before invoking the delegate, so completed samples are not
-retained until a later drain finishes. Buffer leases are released when every
-routed consumer has completed or dropped the sample.
+parallel delegate execution. The active callback is not counted as pending;
+concurrent or reentrant offers use a preallocated circular queue containing only
+the samples behind that callback. Its portable limit is at most 8 pending
+samples, and reducing the limit releases evicted payload leases after leaving
+the delivery mutex. Frame dropping is observable through `droppedSampleCount`
+and `lastDropReason`. The queue clears each dequeued slot before invoking the
+delegate, so completed samples are not retained until a later drain finishes.
+Source-drop callbacks share the same serial drain and cannot overlap a sample
+callback. Buffer leases are released when every routed consumer has completed
+or dropped the sample.
 
 The sample-routing path is zero-copy by contract. The registry owns only small
 device descriptors and provider references; it never owns, converts, or caches

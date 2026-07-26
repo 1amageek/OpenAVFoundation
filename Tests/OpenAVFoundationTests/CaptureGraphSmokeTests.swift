@@ -158,6 +158,9 @@ struct CaptureGraphSmokeTests {
         #expect(throws: AVCaptureVideoDataOutputError.invalidPendingSampleLimit(-1)) {
             try output.setPendingSampleLimit(-1)
         }
+        #expect(throws: AVCaptureVideoDataOutputError.invalidPendingSampleLimit(9)) {
+            try output.setPendingSampleLimit(9)
+        }
 
         delegate.release()
         #expect(await firstOffer.value == .accepted)
@@ -226,6 +229,191 @@ struct CaptureGraphSmokeTests {
         #expect(await firstOffer.value == .accepted)
         #expect(retainedThirdSample.value === nil)
         #expect(delegate.deliveryCount() == 3)
+    }
+
+    @Test("Lowering the pending limit releases excess sample leases")
+    func loweringPendingLimitReleasesExcessSamples() async throws {
+        let fixture = try CaptureGraphFixture()
+        let device = try await fixture.discoveredDevice()
+        let input = try AVCaptureDeviceInput(device: device)
+        let output = AVCaptureVideoDataOutput()
+        let delegate = BlockingVideoDelegate()
+        output.setSampleBufferDelegate(delegate)
+        output.alwaysDiscardsLateVideoFrames = false
+        try output.setPendingSampleLimit(3)
+
+        let connection = AVCaptureConnection(
+            inputPorts: input.ports,
+            output: output
+        )
+        let delivery = output.deliveryEndpoint
+        let firstOperation = VideoOutputOfferOperation(
+            delivery: delivery,
+            sampleBuffer: fixture.sampleBuffer,
+            output: output,
+            connection: connection
+        )
+        let firstOffer = Task {
+            firstOperation.offer()
+        }
+        #expect(delegate.waitUntilEntered())
+
+        var retained: CMImageSampleBuffer? = try fixture.makeSampleBuffer()
+        var firstEvicted: CMImageSampleBuffer? = try fixture.makeSampleBuffer()
+        var secondEvicted: CMImageSampleBuffer? = try fixture.makeSampleBuffer()
+        let retainedReference = WeakReference(retained)
+        let firstEvictedReference = WeakReference(firstEvicted)
+        let secondEvictedReference = WeakReference(secondEvicted)
+        #expect(delivery.offer(
+            try #require(retained),
+            output: output,
+            from: connection
+        ) == .accepted)
+        #expect(delivery.offer(
+            try #require(firstEvicted),
+            output: output,
+            from: connection
+        ) == .accepted)
+        #expect(delivery.offer(
+            try #require(secondEvicted),
+            output: output,
+            from: connection
+        ) == .accepted)
+        retained = nil
+        firstEvicted = nil
+        secondEvicted = nil
+
+        try output.setPendingSampleLimit(1)
+        #expect(retainedReference.value !== nil)
+        #expect(firstEvictedReference.value === nil)
+        #expect(secondEvictedReference.value === nil)
+        #expect(output.droppedSampleCount == 2)
+        #expect(output.lastDropReason == .queueFull)
+
+        delegate.release()
+        #expect(await firstOffer.value == .accepted)
+        #expect(retainedReference.value === nil)
+    }
+
+    @Test("Source-drop and sample callbacks are serialized")
+    func sourceDropAndSampleCallbacksAreSerialized() async throws {
+        let fixture = try CaptureGraphFixture()
+        let device = try await fixture.discoveredDevice()
+        let input = try AVCaptureDeviceInput(device: device)
+        let output = AVCaptureVideoDataOutput()
+        let delegate = SerializingVideoAndDropDelegate()
+        output.setSampleBufferDelegate(delegate)
+        let connection = AVCaptureConnection(
+            inputPorts: input.ports,
+            output: output
+        )
+        let delivery = output.deliveryEndpoint
+        let sampleOperation = VideoOutputOfferOperation(
+            delivery: delivery,
+            sampleBuffer: fixture.sampleBuffer,
+            output: output,
+            connection: connection
+        )
+        let sampleOffer = Task {
+            sampleOperation.offer()
+        }
+        #expect(delegate.waitUntilSampleEntered())
+
+        let drop = CaptureStreamDropEvent(
+            presentationTimeStamp: CMTime(value: 7, timescale: 30),
+            cumulativeCount: 1,
+            reason: .discontinuity
+        )
+        delivery.notifySourceDrop(
+            drop,
+            output: output,
+            from: connection
+        )
+        #expect(!delegate.waitForDrop(milliseconds: 20))
+
+        delegate.releaseSample()
+        #expect(await sampleOffer.value == .accepted)
+        #expect(delegate.waitForDrop(milliseconds: 2_000))
+        #expect(delegate.maximumConcurrentCallbacks == 1)
+        #expect(delegate.callbackOrder == ["sample", "drop"])
+    }
+
+    @Test("Source-drop metadata does not consume the pending sample limit")
+    func sourceDropDoesNotConsumePendingSampleLimit() async throws {
+        let fixture = try CaptureGraphFixture()
+        let device = try await fixture.discoveredDevice()
+        let input = try AVCaptureDeviceInput(device: device)
+        let output = AVCaptureVideoDataOutput()
+        let delegate = SerializingVideoAndDropDelegate()
+        output.setSampleBufferDelegate(delegate)
+        output.alwaysDiscardsLateVideoFrames = false
+        try output.setPendingSampleLimit(1)
+        let connection = AVCaptureConnection(
+            inputPorts: input.ports,
+            output: output
+        )
+        let delivery = output.deliveryEndpoint
+        let sampleOperation = VideoOutputOfferOperation(
+            delivery: delivery,
+            sampleBuffer: fixture.sampleBuffer,
+            output: output,
+            connection: connection
+        )
+        let firstOffer = Task {
+            sampleOperation.offer()
+        }
+        #expect(delegate.waitUntilSampleEntered())
+
+        delivery.notifySourceDrop(
+            CaptureStreamDropEvent(
+                presentationTimeStamp: CMTime(value: 7, timescale: 30),
+                cumulativeCount: 1,
+                reason: .discontinuity
+            ),
+            output: output,
+            from: connection
+        )
+        #expect(sampleOperation.offer() == .accepted)
+        #expect(sampleOperation.offer() == .dropped)
+
+        delegate.releaseSample()
+        #expect(delegate.waitUntilSampleEntered())
+        delegate.releaseSample()
+        #expect(await firstOffer.value == .accepted)
+        #expect(delegate.waitForDrop(milliseconds: 2_000))
+        #expect(delegate.maximumConcurrentCallbacks == 1)
+        #expect(delegate.callbackOrder == ["sample", "drop", "sample"])
+        #expect(output.droppedSampleCount == 1)
+        #expect(output.lastDropReason == .queueFull)
+    }
+
+    @Test("Reentrant sample offers respect the pending bound")
+    func reentrantSampleOffersRespectPendingBound() async throws {
+        let fixture = try CaptureGraphFixture()
+        let device = try await fixture.discoveredDevice()
+        let input = try AVCaptureDeviceInput(device: device)
+        let output = AVCaptureVideoDataOutput()
+        output.alwaysDiscardsLateVideoFrames = false
+        try output.setPendingSampleLimit(1)
+        let connection = AVCaptureConnection(
+            inputPorts: input.ports,
+            output: output
+        )
+        let operation = VideoOutputOfferOperation(
+            delivery: output.deliveryEndpoint,
+            sampleBuffer: fixture.sampleBuffer,
+            output: output,
+            connection: connection
+        )
+        let delegate = ReentrantOfferDelegate(operation: operation)
+        output.setSampleBufferDelegate(delegate)
+
+        #expect(operation.offer() == .accepted)
+        #expect(delegate.offerDispositions == [.accepted, .dropped])
+        #expect(delegate.deliveryCount == 2)
+        #expect(delegate.maximumConcurrentCallbacks == 1)
+        #expect(output.droppedSampleCount == 1)
+        #expect(output.lastDropReason == .queueFull)
     }
 
     @Test("Device resolves formats without opening a running stream")
@@ -1575,6 +1763,82 @@ private final class BlockingVideoDelegate:
     }
 }
 
+private final class SerializingVideoAndDropDelegate:
+    AVCaptureVideoDataOutputSampleBufferDelegate,
+    Sendable
+{
+    private struct State: Sendable {
+        var activeCallbacks = 0
+        var maximumConcurrentCallbacks = 0
+        var callbackOrder: [String] = []
+    }
+
+    private let sampleEntered = DispatchSemaphore(value: 0)
+    private let sampleRelease = DispatchSemaphore(value: 0)
+    private let dropDelivered = DispatchSemaphore(value: 0)
+    private let state = Mutex(State())
+
+    var maximumConcurrentCallbacks: Int {
+        state.withLock { state in state.maximumConcurrentCallbacks }
+    }
+
+    var callbackOrder: [String] {
+        state.withLock { state in state.callbackOrder }
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: any CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        begin("sample")
+        sampleEntered.signal()
+        _ = sampleRelease.wait(timeout: .now() + 2)
+        end()
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didDrop event: CaptureStreamDropEvent,
+        from connection: AVCaptureConnection
+    ) {
+        begin("drop")
+        end()
+        dropDelivered.signal()
+    }
+
+    func waitUntilSampleEntered() -> Bool {
+        sampleEntered.wait(timeout: .now() + 2) == .success
+    }
+
+    func releaseSample() {
+        sampleRelease.signal()
+    }
+
+    func waitForDrop(milliseconds: Int) -> Bool {
+        dropDelivered.wait(
+            timeout: .now() + .milliseconds(milliseconds)
+        ) == .success
+    }
+
+    private func begin(_ name: String) {
+        state.withLock { state in
+            state.activeCallbacks += 1
+            state.maximumConcurrentCallbacks = max(
+                state.maximumConcurrentCallbacks,
+                state.activeCallbacks
+            )
+            state.callbackOrder.append(name)
+        }
+    }
+
+    private func end() {
+        state.withLock { state in
+            state.activeCallbacks -= 1
+        }
+    }
+}
+
 private final class ReentrantVideoDelegate:
     AVCaptureVideoDataOutputSampleBufferDelegate,
     Sendable
@@ -1604,6 +1868,63 @@ private final class ReentrantVideoDelegate:
 
     func didReenterSuccessfully() -> Bool {
         succeeded.withLock { succeeded in succeeded }
+    }
+}
+
+private final class ReentrantOfferDelegate:
+    AVCaptureVideoDataOutputSampleBufferDelegate,
+    Sendable
+{
+    private struct State: Sendable {
+        var activeCallbacks = 0
+        var maximumConcurrentCallbacks = 0
+        var deliveryCount = 0
+        var offerDispositions: [CaptureSampleDisposition] = []
+    }
+
+    private let operation: VideoOutputOfferOperation
+    private let state = Mutex(State())
+
+    init(operation: VideoOutputOfferOperation) {
+        self.operation = operation
+    }
+
+    var offerDispositions: [CaptureSampleDisposition] {
+        state.withLock { state in state.offerDispositions }
+    }
+
+    var deliveryCount: Int {
+        state.withLock { state in state.deliveryCount }
+    }
+
+    var maximumConcurrentCallbacks: Int {
+        state.withLock { state in state.maximumConcurrentCallbacks }
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: any CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        let shouldReenter = state.withLock { state in
+            state.activeCallbacks += 1
+            state.maximumConcurrentCallbacks = max(
+                state.maximumConcurrentCallbacks,
+                state.activeCallbacks
+            )
+            state.deliveryCount += 1
+            return state.deliveryCount == 1
+        }
+        if shouldReenter {
+            let first = operation.offer()
+            let second = operation.offer()
+            state.withLock { state in
+                state.offerDispositions = [first, second]
+            }
+        }
+        state.withLock { state in
+            state.activeCallbacks -= 1
+        }
     }
 }
 
