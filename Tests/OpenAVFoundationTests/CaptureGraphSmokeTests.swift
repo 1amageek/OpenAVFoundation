@@ -930,7 +930,7 @@ struct CaptureGraphSmokeTests {
     @Test("Connection configuration reaches the stream request")
     func connectionConfigurationReachesStreamRequest() async throws {
         let capabilities = try CaptureVideoConnectionCapabilities(
-            supportedOrientations: [.portrait],
+            supportedRotationAngles: [.clockwise90],
             supportedStabilizationModes: [.standard],
             supportedMirroringModes: [.automatic]
         )
@@ -939,14 +939,20 @@ struct CaptureGraphSmokeTests {
         )
         let session = try await fixture.configuredSession()
         let requested = CaptureVideoConnectionConfiguration(
-            orientation: .portrait,
+            rotationAngle: .clockwise90,
             stabilizationMode: .standard,
             mirroringMode: .automatic
         )
         let connection = session.connections[0]
         #expect(connection.automaticallyAdjustsVideoMirroring)
         #expect(connection.preferredVideoStabilizationMode == .off)
-        connection.videoOrientation = .portrait
+        #expect(connection.isVideoRotationAngleSupported(90))
+        #expect(!connection.isVideoRotationAngleSupported(45))
+        #expect(throws: AVCaptureConnectionError.invalidVideoRotationAngle(45)) {
+            try connection.setVideoRotationAngle(45)
+        }
+        try connection.setVideoRotationAngle(90)
+        #expect(connection.videoRotationAngle == 90)
         connection.preferredVideoStabilizationMode = .standard
         connection.automaticallyAdjustsVideoMirroring = false
         #expect(!connection.automaticallyAdjustsVideoMirroring)
@@ -958,6 +964,14 @@ struct CaptureGraphSmokeTests {
         #expect(connection.videoConnectionConfiguration == requested)
 
         try await session.startRunning()
+        #expect(!connection.isVideoRotationAngleSupported(180))
+        #expect(
+            throws:
+                AVCaptureConnectionError.unsupportedVideoRotationAngle(180)
+        ) {
+            try connection.setVideoRotationAngle(180)
+        }
+        #expect(connection.videoRotationAngle == 90)
         #expect(
             await fixture.handle.requestedStream()?
                 .videoConnectionConfiguration == requested
@@ -1355,7 +1369,6 @@ private struct CaptureGraphFixture: Sendable {
             revision: descriptor.capabilityRevision,
             formats: [format],
             preferredFormatID: format.formatID,
-            supportsConcurrentStreams: false,
             controls: controlCapabilities,
             streams: [streamDescriptor],
             supportedStreamCombinations: [

@@ -74,13 +74,16 @@ claim every Objective-C execution convention:
   `CaptureStreamDropEvent` instead of manufacturing a fake sample. The same
   metadata value reaches session runtime state and each connected video output
   in graph order, with every callback outside locks.
-- Apple exposes nonoptional connection orientation/stabilization values and
-  defaults stabilization to `.off` and automatic mirroring to `true`.
-  OpenAVFoundation exposes the same basic property names with portable enums;
-  `videoOrientation` is optional because `.nil` explicitly means provider
-  preservation. Untouched connection configuration remains `.unchanged`.
-  Reading the other two properties reports Apple's `.off`/automatic defaults;
-  assigning any property stages an explicit policy for the next session start.
+- Apple exposes `videoRotationAngle` as `CGFloat`. The shared target uses
+  `Double?` because CoreGraphics is unavailable and `.nil` explicitly means
+  preserve the provider policy. The nonthrowing property traps for an invalid
+  assignment as Apple's setter raises an invalid-argument exception, while
+  `setVideoRotationAngle(_:)` provides a typed portable failure path.
+  `isVideoRotationAngleSupported(_:)` rejects non-quarter-turn values and uses
+  resolved stream capabilities when available; session start remains the
+  authoritative capability-validation boundary. Stabilization defaults to
+  `.off`, automatic mirroring defaults to `true`, and untouched connection
+  configuration remains `.unchanged`.
 - `resolvedFormats()` explicitly opens a short-lived Driver handle to obtain a
   revision-consistent capability snapshot. `select(format:frameRate:)` stages
   the configuration that the session applies to its own handle at start. This
@@ -296,8 +299,8 @@ Each `AVCaptureConnection` stores one Mutex-protected
 `CaptureVideoConnectionConfiguration`. Start snapshots the committed
 connections, requires all fan-out connections for the single source stream to
 request the same policy, validates that policy against the selected stream
-descriptor, and passes it through `CaptureStreamRequest`. Unsupported
-orientation, stabilization, or mirroring remains a typed Driver failure rather
+descriptor, and passes it through `CaptureStreamRequest`. Unsupported rotation
+angle, stabilization, or mirroring remains a typed Driver failure rather
 than a no-op.
 
 An observation output is a future OpenAVFoundation extension, not an Apple API

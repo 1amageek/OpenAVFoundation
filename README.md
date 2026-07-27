@@ -19,7 +19,9 @@ Explicit provider registration, multi-provider discovery, stable
 driver-namespaced device identity, authorization mapping, capture input ports,
 failure-atomic one-input / multiple-video-output session configuration, explicit device
 format and frame-rate selection, typed lifecycle failures, and bounded
-zero-copy sample delivery are implemented.
+zero-copy sample delivery are implemented. Video rotation angles are validated
+against resolved stream capabilities and reach the platform driver as an
+explicit stream policy.
 
 ```text
 provider → device → device input → source stream

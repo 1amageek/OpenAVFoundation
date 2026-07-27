@@ -86,7 +86,7 @@ stable AVCaptureDevice identity cache
 - [x] multi-output sample fan-out and backpressure
 - [x] typed interruption, resume, pressure, source-drop, and terminal-failure session events
 - [x] undeclared stream events fail visibly instead of silently stopping
-- [x] stream-request video orientation, stabilization, and mirroring policy
+- [x] stream-request video rotation-angle, stabilization, and mirroring policy
 - [x] metadata-only source-drop fan-out to video delegates without a fake sample buffer
 
 ## Progress

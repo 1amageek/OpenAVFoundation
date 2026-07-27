@@ -42,22 +42,71 @@ public final class AVCaptureConnection {
         }
     }
 
-    public var videoOrientation: CaptureVideoOrientation? {
+    public var videoRotationAngle: Double? {
         get {
             state.withLock { state in
-                state.videoConnectionConfiguration.orientation
+                state.videoConnectionConfiguration.rotationAngle?.rawValue
             }
         }
         set {
-            state.withLock { state in
-                let current = state.videoConnectionConfiguration
-                state.videoConnectionConfiguration =
-                    CaptureVideoConnectionConfiguration(
-                        orientation: newValue,
-                        stabilizationMode: current.stabilizationMode,
-                        mirroringMode: current.mirroringMode
-                    )
+            guard let newValue else {
+                state.withLock { state in
+                    let current = state.videoConnectionConfiguration
+                    state.videoConnectionConfiguration =
+                        CaptureVideoConnectionConfiguration(
+                            rotationAngle: nil,
+                            stabilizationMode: current.stabilizationMode,
+                            mirroringMode: current.mirroringMode
+                        )
+                }
+                return
             }
+            do {
+                try setVideoRotationAngle(newValue)
+            } catch {
+                preconditionFailure("Invalid video rotation angle: \(error)")
+            }
+        }
+    }
+
+    public func isVideoRotationAngleSupported(_ angle: Double) -> Bool {
+        guard let rotationAngle = CaptureVideoRotationAngle(rawValue: angle)
+        else {
+            return false
+        }
+        var foundDeviceInput = false
+        for port in inputPorts where port.mediaType == .video {
+            guard let input = port.input as? AVCaptureDeviceInput else {
+                continue
+            }
+            foundDeviceInput = true
+            if let supported = input.device.isVideoRotationAngleSupported(
+                rotationAngle
+            ) {
+                return supported
+            }
+        }
+        return foundDeviceInput
+    }
+
+    public func setVideoRotationAngle(
+        _ angle: Double
+    ) throws(AVCaptureConnectionError) {
+        guard let rotationAngle = CaptureVideoRotationAngle(rawValue: angle)
+        else {
+            throw .invalidVideoRotationAngle(angle)
+        }
+        guard isVideoRotationAngleSupported(angle) else {
+            throw .unsupportedVideoRotationAngle(angle)
+        }
+        state.withLock { state in
+            let current = state.videoConnectionConfiguration
+            state.videoConnectionConfiguration =
+                CaptureVideoConnectionConfiguration(
+                    rotationAngle: rotationAngle,
+                    stabilizationMode: current.stabilizationMode,
+                    mirroringMode: current.mirroringMode
+                )
         }
     }
 
@@ -75,7 +124,7 @@ public final class AVCaptureConnection {
                 let current = state.videoConnectionConfiguration
                 state.videoConnectionConfiguration =
                     CaptureVideoConnectionConfiguration(
-                        orientation: current.orientation,
+                        rotationAngle: current.rotationAngle,
                         stabilizationMode: newValue,
                         mirroringMode: current.mirroringMode
                     )
@@ -107,7 +156,7 @@ public final class AVCaptureConnection {
                 }
                 state.videoConnectionConfiguration =
                     CaptureVideoConnectionConfiguration(
-                        orientation: current.orientation,
+                        rotationAngle: current.rotationAngle,
                         stabilizationMode: current.stabilizationMode,
                         mirroringMode: mirroringMode
                     )
@@ -126,7 +175,7 @@ public final class AVCaptureConnection {
                 let current = state.videoConnectionConfiguration
                 state.videoConnectionConfiguration =
                     CaptureVideoConnectionConfiguration(
-                        orientation: current.orientation,
+                        rotationAngle: current.rotationAngle,
                         stabilizationMode: current.stabilizationMode,
                         mirroringMode: newValue ? .enabled : .disabled
                     )

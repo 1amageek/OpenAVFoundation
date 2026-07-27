@@ -356,6 +356,29 @@ public final class AVCaptureDevice: Hashable, Sendable {
         }
     }
 
+    func isVideoRotationAngleSupported(
+        _ angle: CaptureVideoRotationAngle
+    ) -> Bool? {
+        withConfigurationState { state in
+            guard let capabilities = state.capabilities else {
+                return nil
+            }
+            let formatID =
+                state.selectedFormatID ?? capabilities.preferredFormatID
+            guard let stream = capabilities.streams.first(where: {
+                $0.mediaType == .video && $0.formatIDs.contains(formatID)
+            }) else {
+                return false
+            }
+            guard let videoCapabilities =
+                stream.videoConnectionCapabilities
+            else {
+                return false
+            }
+            return videoCapabilities.supportedRotationAngles.contains(angle)
+        }
+    }
+
     private static func formats(
         from capabilities: CaptureDeviceCapabilities
     ) -> [Format] {
